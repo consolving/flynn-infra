@@ -1,0 +1,28 @@
+version: "3.8"
+
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      - ./flynn:/go/src/github.com/flynn/flynn
+      - go-cache:/go/pkg
+      - build-cache:/root/.cache/go-build
+    working_dir: /go/src/github.com/flynn/flynn
+    stdin_open: true
+    tty: true
+    privileged: false
+
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: flynn
+      POSTGRES_PASSWORD: flynn
+      POSTGRES_DB: flynn
+    ports:
+      - "5432:5432"
+
+volumes:
+  go-cache:
+  build-cache:

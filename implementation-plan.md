@@ -1,0 +1,302 @@
+# Implementation Plan
+
+## Project Context
+
+**Goal**: Rebuild the Flynn PaaS from an unmaintained state, starting with the TUF (The Update Framework) repository needed for secure component distribution. The original TUF repository and release hosting (`dl.flynn.io`, `releases.flynn.io`) are offline.
+
+**TUF Security Model**: Flynn uses TUF to provide rollback protection, role-based key management, and CDN compromise resistance. The key hierarchy is:
+
+| Role | Keys | Threshold | Purpose |
+|---|---|---|---|
+| Root | 4 ed25519 keys | 2 signatures | Root of trust |
+| Targets | 1 key | 1 signature | List of target files (images, binaries) |
+| Snapshot | 1 key | 1 signature | Snapshot of targets.json |
+| Timestamp | 1 key | 1 signature | Freshness guarantee |
+
+**Key Decisions**:
+- **The TUF chicken-and-egg problem**: To build Flynn, the TUF repository is needed; but to populate the TUF repository, Flynn must be built. The solution is to use a manually-built `flynn-host` binary for initial bootstrap, bypassing the TUF download step.
+- **Build strategy**: Due to broken orchestration in the original repository (offline dependencies), core components are currently built manually using `go build`.
+- **TUF hosting**: The new TUF repository is deployed to GitHub Pages at `https://consolving.github.io/flynn-tuf-repo`.
+
+## Completed
+
+- [x] Initialize new TUF repository with 4 ed25519 root keys (2-of-4 threshold)
+- [x] Generate and store keys for all TUF roles (root, targets, snapshot, timestamp)
+- [x] Create signed TUF metadata (root.json, targets.json, snapshot.json, timestamp.json)
+- [x] Update `tup.config` and `builder/manifest.json` to point to new TUF repo URL and root keys
+- [x] Verify root key consistency between `tup.config` and `builder/manifest.json`
+- [x] Set up `flynn-tuf-repo/` as a standalone Git repository for GitHub Pages deployment
+- [x] Document TUF key hierarchy and configuration in project notes
+
+## Phase 1: Development Environment (Complete)
+
+The original build system is self-hosting (requires a running Flynn cluster) and depends on offline infrastructure (`dl.flynn.io`, `releases.flynn.io`). Before any code changes can be tested, a working local development environment must exist.
+
+- [x] Create a containerized Linux dev environment (Dockerfile + docker-compose) that can build Flynn components — see `specs/dev-environment.md`
+- [x] Verify `go build ./cli` works in the container (CLI has the fewest Linux-specific deps)
+- [x] Verify `go build ./controller/...` works in the container
+- [x] Verify `go build ./host` works in the container (requires CGO + libcontainer)
+- [x] Run unit tests for pure-Go packages (`go test ./pkg/cors/... ./discoverd/health/...`) and fix any failures
+- [x] Fix the JSON syntax error in `builder/manifest.json` (duplicate `cli-linux-aarch64` entries near line 700)
+
+Additionally completed:
+- [x] Set up a dedicated Proxmox VE build server with ZFS root (4x Intel 480GB SSDs, 2x mirror)
+- [x] Go 1.13.15 installed natively on server, all three core components build natively
+- [x] Docker 29.4.0 installed with ZFS storage driver on `rpool/docker`
+- [x] `protoc` verified: can regenerate `controller/api/controller.pb.go` from `.proto` (with `protoc-gen-go@v1.4.1`)
+- [x] Dockerfile.dev updated to include `libprotobuf-dev` and `protoc-gen-go` for out-of-the-box protobuf support
+
+## Phase 2: Break the Bootstrap Chicken-and-Egg (Complete)
+
+The build script (`script/build-flynn`) downloaded a pre-built `flynn-host` binary from the now-offline TUF repo. This dependency has been replaced with a source-based bootstrap.
+
+- [x] Build `flynn-host` manually in the dev container and archive it as a bootstrap artifact
+- [x] Update `script/build-flynn` to use the local bootstrap `flynn-host` instead of downloading from `dl.flynn.io`
+- [x] Update `base_layer` URL in `builder/manifest.json` (now points to new TUF repo)
+- [x] Create a minimal bootstrap flow that does not require `releases.flynn.io` channel API
+
+Additionally completed:
+- [x] Created `script/bootstrap-build` — standalone script that builds all 34 components from source without a running cluster
+- [x] Updated Go source code defaults to use new TUF repo (`pkg/tufconfig/tufconfig.go`, `host/cli/download.go`, `host/cli/update.go`)
+- [x] Updated all hardcoded `dl.flynn.io` references in functional code (scripts, Go defaults, packer configs)
+- [x] Disabled telemetry (original `dl.flynn.io/measure/scheduler` endpoint is offline)
+- [x] TUF root keys (4x ed25519) now embedded in source defaults and injected via ldflags at build time
+- [x] All 34 binaries build in ~35 seconds on the build server with version embedding via ldflags
+- [x] Unit tests pass (`pkg/cors`, `discoverd/health`, `pkg/*`)
+
+## Phase 3: Populate the TUF Repository (Complete)
+
+The TUF metadata existed but the repository contained no actual target artifacts. All artifacts have been built, signed, and deployed.
+
+- [x] Define which artifacts must be published as TUF targets (images, binaries, manifests)
+- [x] Build the core set of component images using the dev environment
+- [x] Sign and publish built artifacts to the TUF repository
+- [x] Deploy `flynn-tuf-repo` to GitHub Pages (`https://consolving.github.io/flynn-tuf-repo`)
+- [x] Verify end-to-end: `flynn-host download` can pull images from the new TUF repo
+
+Additionally completed:
+- [x] Expanded `script/bootstrap-build` to compile all 34 Flynn binaries (from 10)
+- [x] Created `script/export-tuf/main.go` — standalone Go tool (~1027 lines) that builds squashfs layers from source, constructs ImageManifests/Artifacts, generates bootstrap-manifest.json and images.json, stages and signs all TUF targets
+- [x] Fixed `builder/img/busybox.sh` — uses system `busybox-static` (original download URL was 404), fixed symlink collision bug
+- [x] Fixed `builder/img/ubuntu-bionic.sh` — uses `debootstrap` with bind mounts (original partner-images.canonical.com URL was 404)
+- [x] Fixed TUF repo URL to include `/repository` suffix in all 17 source locations (go-tuf HTTPRemoteStore appends paths directly)
+- [x] Fixed TUF root key threshold from `len(RootKeys)` (4) to `1` in 3 Go files (root.json has threshold=1 per role)
+- [x] Fixed infinite re-exec loop in `flynn-host download` — root cause: binaries were built without `--version` flag, so `version.Release()` returned `"dev"` instead of matching the requested version, causing endless re-execution
+- [x] 72 TUF targets published: 5 versioned binaries/manifests, 2 top-level binaries, 20 image manifests, 22 squashfs layers, 22 layer configs, 1 channel file
+- [x] Total repository size: ~268MB (no files exceed GitHub's 100MB limit)
+- [x] End-to-end verified: `flynn-host download` successfully initializes TUF client, downloads 3 binaries, pulls 22 images with squashfs layers into ZFS, and downloads config — all in ~19 seconds
+
+## Phase 4: Restore the Build Pipeline (Complete)
+
+Replace the self-hosting build with a reproducible CI-driven pipeline.
+
+- [x] Create a CI workflow (GitHub Actions) that builds all components in the containerized environment
+- [x] Integrate TUF signing into the CI pipeline (use offline root keys, online timestamp/snapshot keys)
+- [x] Re-enable `make test-unit` without depending on a prior `make build` (decouple GOROOT from build output)
+- [x] Fix `Makefile` portability issues (`readlink -f` is GNU-only, breaks on macOS)
+
+Additionally completed:
+- [x] Created `Dockerfile.ci` — reproducible build environment (Debian Buster, Go 1.13.15, CGO, libseccomp-dev, squashfs-tools, debootstrap, busybox-static)
+- [x] Created `.github/workflows/ci.yml` — two parallel CI jobs: build (compiles all 34 binaries) and test (runs 21 standalone unit test packages)
+- [x] Added `make test-unit-standalone` target — runs pure Go tests without requiring `make build` or a running cluster (uses system Go toolchain directly)
+- [x] Added `make bootstrap-build` target — convenience wrapper for `script/bootstrap-build`
+- [x] Fixed Makefile portability: replaced GNU `readlink -f` with POSIX `cd && pwd -P` for macOS compatibility
+- [x] Identified and excluded problematic test packages: `pkg/lockedfile` (imports Go internal package), `pkg/term` (requires `/dev/tty`)
+- [x] Verified: all 21 unit test packages pass on the build server, all 34 binaries build successfully
+- [x] TUF signing integration deferred to CI secrets setup (keys are offline; CI workflow structure supports adding a signing step later)
+
+## Phase 5: Go Version and Dependency Modernization (Complete)
+
+Go 1.13 was 6+ years old and unsupported. Upgraded to Go 1.22.12 in a single jump with full compilation and unit test success.
+
+- [x] Audit the 3 `replace` directives in `go.mod` to understand what patches the Flynn forks carry
+- [x] Determine minimum viable Go version upgrade target (e.g., 1.21 for workspace support, or 1.22 for latest stdlib)
+- [x] Test compilation with the target Go version, fixing breakages iteratively
+- [ ] Evaluate migrating from `vendor/` to Go module proxies (or keep vendored for reproducibility)
+- [ ] Update `libcontainer`/`runc` fork to a maintained version compatible with modern kernels
+
+Additionally completed:
+- [x] **Go version**: Upgraded from Go 1.13.15 to Go 1.22.12 (latest patch of 1.22 line)
+- [x] **Replace directive audit**: Documented all 3 replace directives:
+  - `flynn/runc v1.0.0-rc1001` — 2 patches: (1) restores veth/loopback network setup code removed by upstream, (2) cgo cross-compilation fix. CRITICAL dependency — Flynn's container networking relies on this.
+  - `godbus/dbus/v5 v5.0.2` — Module path migration shim (v4→v5). Harmless, standard pattern. Indirect only.
+  - `flynn/coreos-pkg v1.0.1` — 1 patch: dlopen stubs for non-Linux. Module graph satisfier only, no code compiled.
+- [x] **Removed `go-bindata`**: Vestigial tool dependency (zero usage in codebase). Removed from `go.mod`, `vendor/`, and `builder/gobin/gobin.go`
+- [x] **Migrated `io/ioutil`**: 69 non-vendor files, ~177 call sites → `io.ReadAll`, `os.ReadFile`, `os.WriteFile`, `os.CreateTemp`, `os.MkdirTemp`, `os.ReadDir`, `io.Discard`, `io.NopCloser`
+- [x] **Migrated `golang.org/x/net/context`**: 22 files → stdlib `context` package
+- [x] **Updated build tags**: 32 files from `// +build` to `//go:build` (via `gofmt`)
+- [x] **Updated vendored `x/` packages**: `golang.org/x/sys` v0.28.0, `golang.org/x/net` v0.30.0, `golang.org/x/crypto` v0.28.0 (from 2019 versions)
+- [x] **Removed `GO111MODULE=on`**: From `script/bootstrap-build` (31 occurrences), `Makefile`, `script/build-flynn`, `script/flynn-builder`, `builder/go-wrapper.sh`
+- [x] **Fixed test failures**:
+  - `pkg/rpcplus/jsonrpc`: `string(int)` → `string(rune(int))` (Go 1.15+ vet error)
+  - `discoverd/health`: Updated HTTP timeout error message check for Go 1.20+ (`context deadline exceeded`)
+  - `pkg/stream`: Renamed example functions to `Example_*` format (Go 1.22 requires matching exported identifiers)
+- [x] **Updated CI**: `Dockerfile.ci` upgraded from Debian Buster + Go 1.13.15 to Debian Bookworm + Go 1.22.12; `.github/workflows/ci.yml` updated accordingly
+- [x] **Full compilation**: All 34+ packages compile successfully with `GOOS=linux GOARCH=amd64 go build ./...`
+- [x] **All 21 unit test packages pass** (verified with `-race -cover`)
+
+### Replace Directive Status
+
+| Directive | Status | Action Needed |
+|---|---|---|
+| `runc` (Flynn fork) | Keep | Carries critical veth networking patch. Future: extract networking code from libcontainer, then upgrade to modern runc. |
+| `dbus` (v4→v5 shim) | Keep | Harmless. Will be eliminated when runc fork is updated to modern version. |
+| `coreos-pkg` (Flynn fork) | Keep | Module graph satisfier only. Will be eliminated when go-systemd upgraded to v22. |
+
+### Remaining Phase 5 Work (Deferred to Phase 6+)
+
+- **vendor/ vs Go modules**: Currently keeping `vendor/` for reproducibility. Re-evaluate when CI is fully operational.
+- **runc fork modernization**: The Flynn runc fork (`v1.0.0-rc1001`) is 6+ years behind on security patches. Upgrading requires extracting the veth/loopback networking into Flynn's own code (using `vishvananda/netlink` directly), then migrating to modern runc. This is a significant undertaking tied to Phase 6 cluster bootstrap work.
+
+## Phase 6: Integration Testing and Cluster Bootstrap
+
+### Multi-Node Test Infrastructure (Vagrant + libvirt)
+
+Flynn's setup process and cluster bootstrap need to be tested in real VMs, not just containers — `flynn-host` requires systemd, cgroups, ZFS, iptables, and full network stack control that containers can't provide.
+
+**Two dev-machines** are available (see `specs/dev-machine.md` for full details):
+
+| Machine | Arch | IP | CPU | RAM | Acceleration |
+|---|---|---|---|---|---|
+| Proxmox server | amd64 | `192.168.168.87` | 2x Xeon E5-2680 v2 (40 cores) | 62 GB | Native KVM (nested virt) |
+| NVIDIA GB10 | arm64 | `192.168.168.113` | Cortex-X925 (10 cores) | 122 GB | Native ARM64 KVM |
+
+**Why not the original Vagrantfiles**: The existing `flynn/Vagrantfile` and `flynn/demo/Vagrantfile` both depend on the offline `dl.flynn.io` for the `flynn-base` box and use VirtualBox as the provider. Neither works as-is.
+
+**Approach**: Custom Debian 13 (Trixie) Vagrant boxes built from official cloud images, using Vagrant with the libvirt provider and KVM hardware acceleration on both machines.
+
+#### Vagrant Box Infrastructure (Complete)
+
+Custom Vagrant boxes were built from official Debian 13 `generic` cloud images (`https://cloud.debian.org/images/cloud/trixie/20260402-2435/`) using a multi-arch build script (`build-box.sh`). The `generic` variant was chosen over `nocloud` because it includes `openssh-server` pre-installed.
+
+**Box customizations**: vagrant user with insecure key (RSA + ed25519), passwordless sudo, SSHD configured via `/etc/ssh/sshd_config.d/99-vagrant.conf`, SSH host keys pre-generated, systemd-networkd enabled with DHCP, cloud-init disabled.
+
+**Build script** has two code paths: native arch uses `virt-customize --run-command`; cross-arch uses `guestfish` file-level operations (can't execute cross-arch binaries via `virt-customize`).
+
+| Box | Arch | Size | Built On | Tested On | Status |
+|---|---|---|---|---|---|
+| `debian13-amd64` | amd64 | 413 MB | x86_64 machine | x86_64 machine (native KVM) | **Verified** |
+| `debian13-arm64` | arm64 | 407 MB | x86_64 machine (cross-arch) | ARM64 machine (native KVM) | **Verified** |
+| `debian13-riscv64` | riscv64 | 409 MB | x86_64 machine (cross-arch) | — | Built, untested (no native hardware) |
+
+**Key discoveries during box building**:
+- KVM only accelerates matching architectures; cross-arch guests fall back to QEMU TCG (unusably slow)
+- AppArmor blocks cross-arch QEMU VMs — fixed with `security_driver = "none"` in `/etc/libvirt/qemu.conf` on both machines
+- Debian 13 `generic` cloud image has no network config outside cloud-init — must enable systemd-networkd and create `.network` file
+- Cloud-init blocks SSH startup without a datasource — disable via `/etc/cloud/cloud-init.disabled`
+- Vagrant's key replacement after initial SSH causes `Connection reset` — use `config.ssh.insert_key = false`
+- ARM64 VMs require UEFI, `virt` machine type, `host-passthrough` CPU mode, virtio input/video (no PS/2 or cirrus on ARM)
+- HashiCorp doesn't build Vagrant for Linux arm64 — installed via `gem install vagrant`
+- `vagrant-libvirt` network dnsmasq can silently die — fix with `virsh net-autostart vagrant-libvirt`
+
+**File locations**:
+- Build script: `/root/vagrant-boxes/build-box.sh` (x86_64 machine), `/tmp/build-box.sh` (local)
+- Source images: `/root/vagrant-boxes/{amd64,arm64,riscv64}/` (x86_64 machine)
+- Built boxes: `/root/vagrant-boxes/debian13-{amd64,arm64,riscv64}.box` (x86_64 machine), `/root/vagrant-boxes/debian13-arm64.box` (ARM64 machine)
+
+- [x] Install Vagrant + vagrant-libvirt + libvirt-daemon-system on x86_64 build server (Vagrant 2.3.8.dev, libvirt 11.3.0, QEMU 10.0.8)
+- [x] Install Vagrant + vagrant-libvirt on ARM64 machine (Vagrant 2.4.9 via gem, vagrant-libvirt 0.12.2, QEMU, libvirt)
+- [x] Download official Debian 13 `generic` cloud images for amd64, arm64, riscv64
+- [x] Create multi-arch Vagrant box build script (`build-box.sh`) with native and cross-arch code paths
+- [x] Build and verify amd64 box — `vagrant up` + `vagrant ssh` works with native KVM on x86_64 machine
+- [x] Build and verify arm64 box — `vagrant up` + `vagrant ssh` works with native KVM on ARM64 machine
+- [x] Build riscv64 box (untested — no native hardware, TCG emulation not viable)
+- [x] Fix AppArmor on both machines (`security_driver = "none"`)
+- [x] Enable `vagrant-libvirt` network autostart on x86_64 machine
+- [x] Document box-building process, Vagrantfile examples, and troubleshooting in `specs/dev-machine.md`
+
+#### Flynn Cluster Vagrantfile (Complete)
+
+**Design**:
+- Debian 13 base (custom boxes above) instead of Ubuntu 18.04 — aligns with dev-machine OS, modern kernel, better hardware support
+- libvirt provider with KVM acceleration (instead of VirtualBox)
+- Private network bridge for inter-node communication (full TCP/UDP connectivity required by discoverd, flannel, flynn-host API)
+- Configurable node count: 1 node (singleton) or 3+ nodes (multi-node; Flynn rejects `--min-hosts=2`)
+- Per node: 4 GB RAM, 2 CPUs, 40 GB storage
+- Provisioning: install ZFS, iptables, cgroups; install `flynn-host` from new TUF repo; configure peer discovery via `--peer-ips` (avoids dependency on offline `discovery.flynn.io`)
+- DNS: wildcard domain pointing to all node IPs (e.g., `*.demo.localflynn.com`)
+
+**Flynn cluster requirements per node**:
+
+| Requirement | Detail |
+|---|---|
+| OS | Debian 13 amd64 (or arm64 on ARM64 machine) |
+| RAM / CPU / Disk | 4 GB / 2 cores / 40 GB minimum |
+| Kernel features | OverlayFS, cgroups v2 (unified hierarchy), ZFS module |
+| System packages | `zfsutils-linux`, `zfs-dkms`, `linux-headers-*`, `iptables`, `curl`, `squashfs-tools` |
+| Network ports | 1111 (discoverd), 1113 (flynn-host API), 5002 (flannel), 53 (DNS), 80/443 (router) |
+| Multi-node minimum | 3 nodes (2 is explicitly rejected by bootstrap) |
+
+- [x] Create a new Vagrantfile (libvirt provider, Debian 13, configurable 1 or 3+ nodes, private network, Flynn provisioning)
+- [x] Test single-node `flynn-host bootstrap` in a Vagrant VM — **all services healthy** (2026-04-13)
+- [ ] Test 3-node cluster bootstrap with `--peer-ips` and `--min-hosts=3`
+
+### Component Bootstrap (Single-Node Complete)
+
+Single-node Flynn cluster bootstrap completed successfully on 2026-04-13. All 40+ bootstrap steps pass, all services report healthy.
+
+**Bootstrap sequence verified**: online-hosts → discoverd → flannel → wait-hosts → postgres (3-layer image) → postgres-wait → controller-cert → controller → controller-wait → controller-inception → postgres-app → flannel-app → discoverd-app → scheduler → redis → mariadb → mongodb → router → gitreceive → tarreceive → blobstore → logaggregator → taffy → status → status-check ("all services healthy") → cluster-monitor → log-complete.
+
+- [x] Get `discoverd` running standalone in a Vagrant VM
+- [x] Get `flannel` networking operational
+- [x] Bootstrap a minimal Flynn cluster (discoverd + flannel + controller + host)
+- [ ] Re-enable integration tests (`script/run-integration-tests`) against the bootstrapped cluster
+- [ ] Validate database appliances (PostgreSQL, MariaDB, MongoDB, Redis)
+
+#### Code Changes for Debian 13 / Cgroups v2 (branch: `debian13-cgroups-v2-bootstrap`)
+
+The following patches were required to make Flynn run on Debian 13 (kernel 6.12, cgroups v2 only, glibc 2.40):
+
+| File | Change | Why |
+|---|---|---|
+| `host/libcontainer_backend.go` | Dual v1/v2 cgroup setup: `setupCGroupsV2()`, `createCGroupPartitionV2()`, `cpuSharesToWeight()`, per-container `CpuWeight` | Debian 13 has `CONFIG_MEMCG_V1=n` — cgroups v1 is compiled out entirely |
+| `vendor/.../notify_linux.go` | v2 OOM notification via inotify on `memory.events` | v1 uses `cgroup.event_control` + eventfd on `memory.oom_control` which doesn't exist on v2 |
+| `vendor/.../apply_raw.go` | Guard `CheckCpushares()` with `!IsCgroup2UnifiedMode()` | `cpu.shares` file doesn't exist on v2; unconditional read causes failure |
+| `host/volume/zfs/zfs.go` | Fallback from `copySparse` (FIEMAP) to sequential `io.Copy` | tmpfs on Debian 13 returns EOPNOTSUPP for FIEMAP ioctl |
+| `vendor/.../dns/clientconfig.go` | Fix `len(s) >= 8` guard to `len(s) >= 9` before `s[:9]` | Debian 13 resolv.conf has `trust-ad` (8 chars), triggering panic |
+| `appliance/postgresql/cmd/flynn-postgres/main.go` | `TimescaleDB: false`, `ExtWhitelist: false` | See "pgextwlist / TimescaleDB restoration" below |
+| `appliance/postgresql/process.go` | `installExtensionsInTemplate()` — pre-installs `uuid-ossp` and `pgcrypto` in template1 | Non-superuser app DB users can't run CREATE EXTENSION without pgextwlist |
+
+**Build requirements**: All binaries destined for container images must be built with `CGO_ENABLED=0` (static linking). The container base is Ubuntu 18.04 Bionic (glibc 2.27); the dev machine has glibc 2.40+. Dynamically-linked binaries fail with `GLIBC_2.34 not found`.
+
+#### TUF Image Rebuilds
+
+| Image | Layers | Change |
+|---|---|---|
+| postgres | 3: base (`33121091`) + packages (`d0f9b319`, 71MB) + binaries (`f4232c7c`, 11MB) | Added PostgreSQL 11 packages layer; rebuilt binaries with `CGO_ENABLED=0` and extension fixes |
+| controller | 2: base (`03fe7735`) + binaries+schemas (`e8a66adf`, 20MB) | Rebuilt with `CGO_ENABLED=0`; added `/etc/flynn-controller/jsonschema/` (was missing, caused nil pointer crash) |
+
+### Remaining Phase 6 Work
+
+- [ ] Test 3-node cluster bootstrap with `--peer-ips` and `--min-hosts=3`
+- [ ] Re-enable integration tests (`script/run-integration-tests`)
+- [ ] Validate database appliances (PostgreSQL, MariaDB, MongoDB, Redis) — start/stop, data persistence, failover
+- [ ] Restore pgextwlist and TimescaleDB support (see below)
+- [ ] Build missing packages layers for remaining images (redis, mariadb, mongodb, gitreceive, taffy)
+- [ ] Publish patched `flynn-host` binary via TUF (currently deployed manually)
+- [ ] Update `implementation-plan.md` with all fixes after stabilization
+
+#### pgextwlist / TimescaleDB Restoration
+
+**Current state**: `TimescaleDB: false` and `ExtWhitelist: false` in `appliance/postgresql/cmd/flynn-postgres/main.go`. The `installExtensionsInTemplate()` workaround pre-installs `uuid-ossp` and `pgcrypto` in `template1`, which covers all of Flynn's internal needs (controller migrations, blobstore).
+
+**What this disables**: End-user applications can no longer self-serve `CREATE EXTENSION` for the ~30 extensions that were previously whitelisted by pgextwlist (hstore, citext, postgis, pg_trgm, plv8, etc.). Any app that relies on these will get a permission error. TimescaleDB is also unavailable, though no Flynn component uses it.
+
+**Why it was necessary**: The postgres packages layer was built manually from Ubuntu 18.04 Bionic repos without adding the third-party PPAs that provide `postgresql-11-pgextwlist` (pgextwlist PPA) and `timescaledb-postgresql-11` (TimescaleDB PPA). PostgreSQL crashes fatally if `shared_preload_libraries` or `local_preload_libraries` references a missing `.so` file.
+
+**To restore full functionality**:
+- [ ] Add TimescaleDB and pgextwlist PPAs to the postgres packages layer build
+- [ ] Install `postgresql-11-pgextwlist` and optionally `timescaledb-postgresql-11`
+- [ ] Re-enable `ExtWhitelist: true` (and optionally `TimescaleDB: true`) in `main.go`
+- [ ] Remove the `installExtensionsInTemplate()` workaround from `process.go` (pgextwlist handles permissions natively)
+- [ ] Rebuild postgres squashfs layer and update TUF repo
+
+**Alternative** (simpler, less flexible): Keep `ExtWhitelist: false` permanently and expand `installExtensionsInTemplate()` to pre-install more extensions (hstore, citext, pg_trgm, etc.) in template1. This avoids the PPA dependency but limits users to a fixed set of extensions.
+
+## Open Questions
+
+- ~~Should the Go version be upgraded incrementally (1.13 -> 1.16 -> 1.19 -> 1.22) or in a single jump?~~ **Resolved**: Single jump to Go 1.22 succeeded.
+- ~~Is ARM64/aarch64 support a priority, or focus on x86_64 first?~~ **Resolved (2026-04-13)**: Both supported in parallel. x86_64 is primary (Proxmox build server), ARM64 available via native NVIDIA GB10 machine. Cross-arch emulation via QEMU TCG is not practical — requires native hardware. RISC-V deferred (no native hardware). See `specs/dev-machine.md`.
+- ~~What is the target Linux distribution for the base layer images (Ubuntu Trusty/Xenial are EOL)?~~ **Resolved**: Debian 13 (Trixie) chosen for Vagrant test VMs. Base layer images for Flynn components still use Ubuntu Bionic (built via debootstrap in Phase 3) — migrating these is future work.
+- ~~When should the runc fork be modernized?~~ **Partially resolved (2026-04-13)**: The vendored runc fork already has cgroups v2 controller code (`cpu_v2.go`, `memory_v2.go`, etc.) which works on Debian 13. The remaining concern is security patches (6+ years of unpatched CVEs), but the fork is functionally adequate for cluster bootstrap. Modernization is desirable but no longer blocking.
+- Should the self-hosting build be preserved long-term, or replaced entirely with container-based CI?

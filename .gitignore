@@ -1,0 +1,23 @@
+# Separate git repositories (submodules or standalone)
+flynn/
+flynn-tuf-repo/
+
+# TUF private keys — NEVER commit these
+tuf-keys-secure/
+
+# macOS resource forks
+._*
+.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Vagrant state
+vagrant/.vagrant/
+
+# OpenCode local state
+.opencode/

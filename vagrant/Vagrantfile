@@ -1,0 +1,152 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# Flynn Cluster Vagrantfile (libvirt provider, Debian 13)
+#
+# Usage:
+#   Single-node:   vagrant up node1
+#   Three-node:    vagrant up
+#   Custom domain: CLUSTER_DOMAIN=test.localflynn.com vagrant up
+#
+# Requirements:
+#   - vagrant-libvirt plugin
+#   - KVM acceleration (/dev/kvm)
+#   - debian13-amd64 box added: vagrant box add debian13-amd64 /path/to/debian13-amd64.box
+#
+# On the x86_64 dev-machine (192.168.168.87):
+#   vagrant box add debian13-amd64 /root/vagrant-boxes/debian13-amd64.box
+#   cd /path/to/this/directory && vagrant up
+#
+
+VAGRANTFILE_API_VERSION = "2"
+
+# --- Configuration -----------------------------------------------------------
+
+# Number of nodes: 1 (singleton) or 3+ (multi-node; Flynn rejects 2)
+NUM_NODES       = (ENV["NUM_NODES"] || "1").to_i
+
+# Resources per node
+NODE_MEMORY     = (ENV["NODE_MEMORY"] || "4096").to_i   # MB (Flynn needs headroom for containers)
+NODE_CPUS       = (ENV["NODE_CPUS"] || "2").to_i
+NODE_DISK_SIZE  = (ENV["NODE_DISK_SIZE"] || "40").to_i  # GB, for ZFS pool
+
+# Networking
+# Private network subnet for inter-node communication.
+# Nodes get IPs: 192.168.50.11, 192.168.50.12, ...
+PRIVATE_SUBNET  = "192.168.50"
+NODE_IP_START   = 11
+
+# Flynn settings
+CLUSTER_DOMAIN  = ENV["CLUSTER_DOMAIN"] || "demo.localflynn.com"
+FLYNN_REPO_URL  = ENV["FLYNN_REPO_URL"] || "https://consolving.github.io/flynn-tuf-repo/repository"
+AUTO_BOOTSTRAP  = ENV["AUTO_BOOTSTRAP"] != "false"  # set to "false" to skip bootstrap
+
+# Path to a locally-built flynn-host binary (for testing patches before TUF republish).
+# The binary will be copied into the VM via the synced /vagrant-data directory.
+# Set to "" or unset to download from TUF repo instead.
+LOCAL_FLYNN_HOST = ENV["LOCAL_FLYNN_HOST"] || ""
+
+# --- Derived values -----------------------------------------------------------
+
+# Build the list of all node IPs for --peer-ips
+NODE_IPS = (0...NUM_NODES).map { |i| "#{PRIVATE_SUBNET}.#{NODE_IP_START + i}" }
+
+# --- Validation ---------------------------------------------------------------
+
+if NUM_NODES == 2
+  abort "ERROR: Flynn rejects --min-hosts=2. Use 1 (singleton) or 3+ nodes."
+end
+
+# --- VM definitions -----------------------------------------------------------
+
+Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
+  config.vm.box = "debian13-amd64"
+  config.ssh.insert_key = false
+
+  # Disable default synced folder (not needed, avoids rsync/nfs issues)
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  (1..NUM_NODES).each do |i|
+    node_name = "node#{i}"
+    node_ip   = "#{PRIVATE_SUBNET}.#{NODE_IP_START + i - 1}"
+
+    config.vm.define node_name, primary: (i == 1) do |node|
+      node.vm.hostname = node_name
+
+      # Private network for inter-node communication
+      node.vm.network :private_network,
+        ip: node_ip,
+        libvirt__network_name: "flynn-cluster",
+        libvirt__dhcp_enabled: false
+
+      # libvirt provider settings
+      node.vm.provider :libvirt do |libvirt|
+        libvirt.driver = "kvm"
+        libvirt.memory = NODE_MEMORY
+        libvirt.cpus   = NODE_CPUS
+
+        # Additional disk for ZFS pool
+        libvirt.storage :file,
+          size: "#{NODE_DISK_SIZE}G",
+          type: "qcow2",
+          bus: "virtio",
+          device: "vdb"
+      end
+
+      # Upload local flynn-host binary if specified
+      if LOCAL_FLYNN_HOST != ""
+        node.vm.provision "upload-binary", type: "file",
+          source: LOCAL_FLYNN_HOST,
+          destination: "/tmp/flynn-host-local"
+      end
+
+      # Phase 1: System provisioning (all nodes)
+      provision_args = [
+        "--node-ip", node_ip,
+        "--repo-url", FLYNN_REPO_URL,
+      ]
+      if LOCAL_FLYNN_HOST != ""
+        provision_args += ["--local-binary", "/tmp/flynn-host-local"]
+      end
+      node.vm.provision "system", type: "shell", privileged: true, path: "provision.sh", args: provision_args
+
+      # Phase 2: Bootstrap (first node only, after all nodes are provisioned)
+      if i == 1 && AUTO_BOOTSTRAP
+        node.vm.provision "bootstrap", type: "shell", privileged: true, inline: <<-SCRIPT
+          set -eo pipefail
+
+          echo "==> Starting flynn-host daemon..."
+          systemctl start flynn-host.service
+
+          # Wait for flynn-host API to be ready
+          for attempt in $(seq 1 30); do
+            if curl -sf http://localhost:1113/host/status >/dev/null 2>&1; then
+              echo "==> flynn-host API is ready"
+              break
+            fi
+            echo "    waiting for flynn-host API (attempt ${attempt}/30)..."
+            sleep 2
+          done
+
+          if ! curl -sf http://localhost:1113/host/status >/dev/null 2>&1; then
+            echo "ERROR: flynn-host API did not become ready"
+            journalctl -u flynn-host --no-pager -n 50
+            exit 1
+          fi
+
+          echo "==> Running flynn-host bootstrap..."
+          CLUSTER_DOMAIN="#{CLUSTER_DOMAIN}" \\
+          flynn-host bootstrap \\
+            --min-hosts=#{NUM_NODES} \\
+            --peer-ips=#{NODE_IPS.join(",")} \\
+            --timeout=600 \\
+            2>&1 | tee /var/log/flynn/bootstrap.log
+
+          echo "==> Bootstrap complete!"
+          echo "    Cluster domain: #{CLUSTER_DOMAIN}"
+          echo "    Dashboard:      https://dashboard.#{CLUSTER_DOMAIN}"
+        SCRIPT
+      end
+    end
+  end
+end

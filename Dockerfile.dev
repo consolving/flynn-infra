@@ -1,0 +1,33 @@
+FROM ubuntu:18.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV GO_VERSION=1.13.15
+ENV GOPATH=/go
+ENV GOROOT=/usr/local/go
+ENV CGO_ENABLED=1
+ENV PATH=/usr/local/go/bin:/go/bin:$PATH
+
+# System dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libseccomp-dev \
+    pkg-config \
+    git \
+    curl \
+    ca-certificates \
+    protobuf-compiler \
+    libprotobuf-dev \
+    sudo \
+    && rm -rf /var/lib/apt/lists/*
+
+# Go toolchain
+RUN curl -fsSL https://dl.google.com/go/go${GO_VERSION}.linux-amd64.tar.gz \
+    | tar -C /usr/local -xz
+
+# Install protoc-gen-go (matches project's golang/protobuf v1.4.1)
+RUN GO111MODULE=on go get github.com/golang/protobuf/protoc-gen-go@v1.4.1
+
+# Working directory at the module path
+WORKDIR /go/src/github.com/flynn/flynn
+
+CMD ["/bin/bash"]
