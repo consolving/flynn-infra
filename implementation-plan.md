@@ -290,6 +290,17 @@ The following patches were required to make Flynn run on Debian 13 (kernel 6.12,
 
 **Build requirements**: All binaries destined for container images must be built with `CGO_ENABLED=0` (static linking). The container base is Ubuntu 18.04 Bionic (glibc 2.27); the dev machine has glibc 2.40+. Dynamically-linked binaries fail with `GLIBC_2.34 not found`.
 
+#### Volume Manager Layer Caching
+
+The `mountSquashfs` function in `libcontainer_backend.go` uses a two-tier caching mechanism:
+
+1. **In-memory map** backed by **BoltDB** (`/var/lib/flynn/volumes/volumes.bolt`) via `GetVolume(layerID)`. If found, returns immediately without downloading.
+2. If NOT found, downloads from the layer URL, writes to a ZFS zvol, mounts as squashfs, and registers in both the in-memory map and BoltDB via `ImportFilesystem`.
+
+**Important**: Simply creating a ZFS zvol manually does NOT register the layer — the volume manager won't know about it. The BoltDB is exclusively locked by the running flynn-host process, so `flynn-host download` can't be used while the daemon is running. Layers are only populated into the volume manager via: (a) `flynn-host download` (before daemon starts), or (b) `ImportFilesystem` triggered by a container start that downloads the layer.
+
+**ZFS zvol replacement does NOT work via dd**: Writing a new squashfs to a ZFS zvol device with `dd` doesn't work — the ZFS ARC caches old blocks and serves stale data even after `drop_caches`, `blockdev --flushbufs`, and even destroying/recreating the zvol. **Workaround**: Mount the new squashfs file directly via loop device (`mount -t squashfs -o ro,loop /tmp/new-layer.squashfs /var/lib/flynn/volumes/zfs/mnt/squashfs/<hash>`).
+
 #### Bugs Found and Fixed During 3-Node Bootstrap (2026-04-14)
 
 **1. PostgreSQL `uuid-ossp` read-only transaction error** (`appliance/postgresql/process.go`): When postgres runs with a sync replica, `postgresql.conf` sets `default_transaction_read_only = on`. The `installExtensionsInTemplate()` function opens a new connection to `template1` to run `CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`, but doesn't override the read-only setting. The DDL fails with `SQLSTATE 25006` (read-only transaction), causing the primary to crash-loop. **Fix**: Added `SET default_transaction_read_only = off` at the start of `installExtensionsInTemplate()` (line ~460). The existing `assumePrimary()` function already does `SET TRANSACTION READ WRITE` but that session-level override doesn't carry over to the extension installation's separate connection.
@@ -308,16 +319,91 @@ The following patches were required to make Flynn run on Debian 13 (kernel 6.12,
 | controller | 2: base (`03fe7735`) + binaries+schemas (`e8a66adf`, 20MB) | Rebuilt with `CGO_ENABLED=0`; added `/etc/flynn-controller/jsonschema/` (was missing, caused nil pointer crash) |
 | flannel | 2: base (`03fe7735`) + binaries (`9d2da31c`, 11MB) | Rebuilt `flanneld` with `CGO_ENABLED=0` and unique VXLAN MAC fix |
 | router | 2: base (`03fe7735`) + binaries (`60cd196b`, 5.6MB) | Rebuilt `flynn-router` with `CGO_ENABLED=0` and `EXTERNAL_IP` registration fix |
+| gitreceive | 3: base (`03fe7735`) + git packages (`d59b6f41`, 28MB) + binaries | Added git packages layer (`apt-get install git`); container was missing `git` binary causing HTTP 500 on push |
+| slugbuilder-18 | 3: base (`03fe7735`) + packages (`80a1e4bf`, 50MB) + binaries | Added combined packages layer with git, ruby, daemontools, pigz, and 5 Heroku buildpacks (Go, multi, Ruby, Node.js, Python) |
+| slugrunner-18 | 3: base (`03fe7735`) + packages (`80a1e4bf`, 50MB) + binaries | Reused slugbuilder packages layer (ruby needed for Procfile parsing via `ruby -r yaml`) |
+
+### Git Push Pipeline Fix (2026-04-14)
+
+The end-to-end git push deployment pipeline (`git push` → gitreceive → slugbuilder → blobstore → slugrunner → router) was broken because almost all TUF repo images were built with only 2 layers (base + binaries), missing the intermediate packages layers that install apt packages, buildpacks, etc. The original Flynn build system ran these package installation steps inside a running cluster (self-hosted), and when the TUF repo was rebuilt from source in Phase 3, only the Go binary layers were generated.
+
+**Root causes fixed**:
+1. **Gitreceive HTTP 500**: The container was missing the `git` binary because the `gitreceive-packages` layer (which runs `apt-get install git`) was never built. Fix: Built a 28MB squashfs layer containing git and dependencies.
+2. **Slugbuilder failures**: Missing heroku-18 + heroku-18-build + slugbuilder-packages stack. Fix: Built a combined 50MB squashfs layer containing git, ruby, daemontools, pigz, and 5 Heroku buildpacks (Go, multi, Ruby, Node.js, Python).
+3. **Slugrunner failures**: Missing ruby (needed for Procfile parsing via `ruby -r yaml`). Fix: Reused the slugbuilder packages layer.
+
+**Deployment method for running cluster**: New layers are served via HTTP from the build server (`192.168.121.1:8888`), then new artifacts/releases/formations are created via the controller API. When the scheduler starts new containers, `mountSquashfs()` in `libcontainer_backend.go` downloads the layers and registers them in the volume manager via `ImportFilesystem()`.
+
+**Verification**: Successfully deployed a Go test app (`test/apps/http`) via `git push flynn master`. The full pipeline completes: gitreceive receives push → spawns slugbuilder job → Go buildpack detects app, installs go1.6.4, compiles → slug tarball uploaded to blobstore → release created → slugrunner starts web process → app accessible via router at `https://test-http.demo.localflynn.com/` returning "ok".
+
+#### Integration Test Progress (2026-04-14)
+
+**Test infrastructure**: `flynn-test` binary built from `test/main.go` (go-check framework, 23 test suites). Runs against existing cluster with `--router-ip 192.168.50.11 --cli /tmp/flynn-cli`.
+
+**Test-apps artifact**: Built `test-apps.json` with busybox base layer (`03fe7735`) + test app binaries layer (`bc9a528e`, 20MB containing echoer, pingserv, ish, http-blocker, signal, oom). Placed at `build/image/test-apps.json` relative to the source tree.
+
+**Tests passing (33)**:
+
+*CLISuite (25)*:
+- `TestCreateAppNoGit`, `TestCluster`, `TestProvider`, `TestApp`, `TestPs`, `TestScale`, `TestScaleAll`
+- `TestRunSignal`, `TestEnv`, `TestMeta`, `TestKill`, `TestRoute`
+- `TestResource`, `TestResourceList`, `TestResourceRemove`
+- `TestLog`, `TestLogFollow`, `TestLogFilter`, `TestLogStderr`
+- `TestRelease`, `TestReleaseRollback`, `TestRemote`
+- `TestDeploy`, `TestDeployTimeout`, `TestLimits`
+
+*ControllerSuite (6)*:
+- `SetUpSuite`, `TestAppDelete`, `TestAppDeleteCleanup`, `TestAppEvents`
+- `TestRouteEvents`, `TestResourceProvisionRecreatedApp`
+
+*PostgresSuite (2)*:
+- `TestSSLRenegotiationLimit`, `TestDumpRestore`
+
+*GitDeploySuite (8)*:
+- `TestNonMasterPush`, `TestRunQuoting`, `TestConfigDir`, `TestSlugignore`
+- `TestAppRecreation`, `TestLargeRepo`, `TestCustomPort`, `TestProcfileChange`
+
+*SchedulerSuite (3)*:
+- `TestScale`, `TestJobMeta`, `TestJobStatus`
+
+**Known failures and reasons**:
+- `CLISuite.TestRunLimits` — reads cgroups v1 paths (`/sys/fs/cgroup/memory/memory.limit_in_bytes`); Debian 13 only has cgroups v2. Needs code fix.
+- `CLISuite.TestReleaseDelete` — calls `assertURI` which does HTTP HEAD to `blobstore.discoverd`, unreachable from build server (no discoverd DNS).
+- `ControllerSuite.TestExampleOutput` — needs `../build/image/controller-examples.json` build artifact.
+- `ControllerSuite.TestKeyRotation`, `TestResourceLimitsOneOffJob` — time out (may need longer timeout or cluster resources).
+- `GitDeploySuite.TestEnvDir/TestEmptyRelease/TestDevStdout/TestSourceVersion/TestBuildCaching/TestCancel/TestCrashingApp/TestPrivateSSHKeyClone` — use `BUILDPACK_URL=https://github.com/kr/heroku-buildpack-inline`; containers can't clone from GitHub (exit 111).
+- `GitDeploySuite.TestGoBuildpack/TestNodejsBuildpack/...` — clone from `github.com/flynn-examples/`; same internet access issue.
+- `GitDeploySuite.TestGitSubmodules` — clones submodule from GitHub.
+- `CLISuite.TestRun` — times out (may need longer timeout).
+
+**Test categories**:
+- **Working**: Tests using `flynn` CLI, controller HTTP API, git push with local test apps, and the test-apps artifact
+- **Blocked by internet access**: Tests that use `BUILDPACK_URL` pointing to GitHub or clone example repos from GitHub. Containers on the overlay network cannot reach external hosts. Fix: either configure NAT/masquerade for container traffic, or mirror buildpacks locally.
+- **Blocked by discoverd DNS**: Tests that make direct HTTP requests to `*.discoverd` service URLs
+- **Blocked by cgroups v2**: `TestRunLimits` reads v1 cgroup paths
+- **Needs sub-cluster**: Tests that spin up a sub-cluster inside Flynn (Discoverd, Volume, Backup tests)
+- **Needs overlay network**: Sirenia deploy tests connect directly to overlay IPs (100.100.x.x) unreachable from build server
 
 ### Remaining Phase 6 Work
 
 - [x] Test 3-node cluster bootstrap with `--peer-ips` and `--min-hosts=3` — complete (2026-04-14), 37 processes across 3 nodes; mariadb/mongodb/router reported unhealthy at status-check but all processes running
 - [x] Fix router discoverd registration — router now registers with `EXTERNAL_IP` instead of `LISTEN_IP`, all non-optional services healthy (2026-04-14)
-- [ ] Re-enable integration tests (`script/run-integration-tests`)
+- [x] Fix git push pipeline — gitreceive, slugbuilder, slugrunner all working with packages layers (2026-04-14)
+- [x] Remove CLI unmaintained warning from `cli/main.go` — broke test output matching (2026-04-14)
+- [x] Clean up macOS `._*` resource fork files from source tree on build server (2026-04-14)
+- [x] Run initial integration tests — 7 tests passing (2026-04-14)
+- [x] Build `test-apps.json` manifest — busybox base + 6 test app binaries (echoer, pingserv, ish, http-blocker, signal, oom), unlocked `createApp()`-based tests (2026-04-14)
+- [x] Run git-deploy integration tests — 8 tests passing (TestCustomPort, TestProcfileChange, etc.) (2026-04-14)
+- [x] Replace single-threaded layer HTTP server with threaded one — fixed node3 download timeouts (2026-04-14)
+- [x] Run comprehensive integration tests — **33 tests passing** across 5 suites (2026-04-14)
+- [ ] Fix `TestRunLimits` for cgroups v2 — update cgroup paths in test or container code
+- [ ] Configure NAT/masquerade for container internet access — to unblock buildpack tests that clone from GitHub
+- [ ] Re-enable full integration test suite (`script/run-integration-tests`)
 - [ ] Validate database appliances (PostgreSQL, MariaDB, MongoDB, Redis) — start/stop, data persistence, failover
 - [ ] Restore pgextwlist and TimescaleDB support (see below)
-- [ ] Build missing packages layers for remaining images (redis, mariadb, mongodb, gitreceive, taffy)
+- [ ] Build missing packages layers for remaining images (redis, mariadb, mongodb, taffy)
 - [ ] Publish patched `flynn-host` binary via TUF (currently deployed manually)
+- [ ] Full TUF repo rebuild with all fixed binaries and packages layers
 
 #### pgextwlist / TimescaleDB Restoration
 
