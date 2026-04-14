@@ -33,12 +33,13 @@ ssh -i ~/.ssh/id_ed25519 root@192.168.168.87
 | Software | Version |
 |---|---|
 | OS | Debian 13 (Trixie) |
-| Kernel | 6.17.2-1-pve (Proxmox PVE kernel) |
+| Kernel | 6.17.13-2-pve (Proxmox PVE kernel) |
 | Docker | 29.4.0 |
-| Go | 1.13.15 |
+| Go | 1.22.12 |
 | QEMU | 10.0.8 |
 | libvirt | 11.3.0 |
 | Vagrant | 2.3.8.dev |
+| ZFS | 2.4.1-pve1 |
 
 ### Configuration Notes
 

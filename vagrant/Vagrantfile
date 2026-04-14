@@ -110,31 +110,57 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
       end
       node.vm.provision "system", type: "shell", privileged: true, path: "provision.sh", args: provision_args
 
-      # Phase 2: Bootstrap (first node only, after all nodes are provisioned)
-      if i == 1 && AUTO_BOOTSTRAP
+      # Phase 2: Start the daemon on every node after provisioning.
+      # For multi-node clusters, all daemons must be running before bootstrap.
+      # Vagrant provisions nodes sequentially (node1, then node2, then node3),
+      # so each node's daemon is started as soon as its provisioning finishes.
+      node.vm.provision "start-daemon", type: "shell", privileged: true, inline: <<-SCRIPT
+        set -eo pipefail
+
+        echo "==> Starting flynn-host daemon on #{node_name}..."
+        systemctl start flynn-host.service
+
+        # Wait for the local API to be ready
+        for attempt in $(seq 1 30); do
+          if curl -sf http://#{node_ip}:1113/host/status >/dev/null 2>&1; then
+            echo "==> flynn-host API is ready on #{node_name} (#{node_ip})"
+            break
+          fi
+          echo "    waiting for flynn-host API (attempt ${attempt}/30)..."
+          sleep 2
+        done
+
+        if ! curl -sf http://#{node_ip}:1113/host/status >/dev/null 2>&1; then
+          echo "ERROR: flynn-host API did not become ready on #{node_name}"
+          journalctl -u flynn-host --no-pager -n 50
+          exit 1
+        fi
+      SCRIPT
+
+      # Phase 3: Bootstrap (last node only, after all nodes are up)
+      # We run bootstrap on the LAST node so that all previous nodes'
+      # daemons are already running when bootstrap's check-online-hosts runs.
+      if i == NUM_NODES && AUTO_BOOTSTRAP
         node.vm.provision "bootstrap", type: "shell", privileged: true, inline: <<-SCRIPT
           set -eo pipefail
 
-          echo "==> Starting flynn-host daemon..."
-          systemctl start flynn-host.service
-
-          # Wait for flynn-host API to be ready
-          for attempt in $(seq 1 30); do
-            if curl -sf http://localhost:1113/host/status >/dev/null 2>&1; then
-              echo "==> flynn-host API is ready"
-              break
+          echo "==> Waiting for all peer daemons to be reachable..."
+          for peer_ip in #{NODE_IPS.join(" ")}; do
+            for attempt in $(seq 1 30); do
+              if curl -sf "http://${peer_ip}:1113/host/status" >/dev/null 2>&1; then
+                echo "    peer ${peer_ip} is ready"
+                break
+              fi
+              echo "    waiting for peer ${peer_ip} (attempt ${attempt}/30)..."
+              sleep 2
+            done
+            if ! curl -sf "http://${peer_ip}:1113/host/status" >/dev/null 2>&1; then
+              echo "ERROR: peer ${peer_ip} did not become ready"
+              exit 1
             fi
-            echo "    waiting for flynn-host API (attempt ${attempt}/30)..."
-            sleep 2
           done
 
-          if ! curl -sf http://localhost:1113/host/status >/dev/null 2>&1; then
-            echo "ERROR: flynn-host API did not become ready"
-            journalctl -u flynn-host --no-pager -n 50
-            exit 1
-          fi
-
-          echo "==> Running flynn-host bootstrap..."
+          echo "==> All #{NUM_NODES} peers are online. Running bootstrap..."
           CLUSTER_DOMAIN="#{CLUSTER_DOMAIN}" \\
           flynn-host bootstrap \\
             --min-hosts=#{NUM_NODES} \\
