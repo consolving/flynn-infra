@@ -212,7 +212,8 @@ Custom Vagrant boxes were built from official Debian 13 `generic` cloud images (
 - libvirt provider with KVM acceleration (instead of VirtualBox)
 - Private network bridge for inter-node communication (full TCP/UDP connectivity required by discoverd, flannel, flynn-host API)
 - Configurable node count: 1 node (singleton) or 3+ nodes (multi-node; Flynn rejects `--min-hosts=2`)
-- Per node: 4 GB RAM, 2 CPUs, 40 GB storage
+- Auto-scaling resources: single-node gets 4 GB / 2 CPUs; multi-node gets 8 GB / 4 CPUs per node (overridable via `NODE_MEMORY`, `NODE_CPUS`)
+- Per node: 40 GB storage (ZFS pool on separate vdb disk)
 - Provisioning: install ZFS, iptables, cgroups; install `flynn-host` from new TUF repo; configure peer discovery via `--peer-ips` (avoids dependency on offline `discovery.flynn.io`)
 - DNS: wildcard domain pointing to all node IPs (e.g., `*.demo.localflynn.com`)
 
@@ -221,15 +222,44 @@ Custom Vagrant boxes were built from official Debian 13 `generic` cloud images (
 | Requirement | Detail |
 |---|---|
 | OS | Debian 13 amd64 (or arm64 on ARM64 machine) |
-| RAM / CPU / Disk | 4 GB / 2 cores / 40 GB minimum |
+| RAM / CPU / Disk | 4 GB / 2 cores / 40 GB minimum (singleton); 8 GB / 4 cores / 40 GB (multi-node HA) |
 | Kernel features | OverlayFS, cgroups v2 (unified hierarchy), ZFS module |
 | System packages | `zfsutils-linux`, `zfs-dkms`, `linux-headers-*`, `iptables`, `curl`, `squashfs-tools` |
 | Network ports | 1111 (discoverd), 1113 (flynn-host API), 5002 (flannel), 53 (DNS), 80/443 (router) |
 | Multi-node minimum | 3 nodes (2 is explicitly rejected by bootstrap) |
 
+**Multi-node resource analysis**: HA mode runs ~37 processes across 3 nodes (~13 per node). Each process has a default cgroup memory limit of 1 GiB (hardcoded in `host/resource/resource.go`), but actual usage is 200-500 MB per process. Flynn forces `overcommit_memory=1` at the kernel level, so declared limits don't need to fit in physical RAM — they're cgroup hard caps, not reservations. The scheduler is resource-unaware (load-balances by job count only). 8 GB per node provides comfortable headroom for actual memory usage without OOM kills.
+
+**Multi-node bootstrap flow**: Vagrant provisions nodes sequentially (node1 → node2 → node3). Each node's daemon starts immediately after provisioning. `--peer-ips` is NOT passed to the daemon because `ConnectPeer()` blocks ~60s per unreachable peer — and during initial cluster formation, no discoverd is running on any peer yet. Instead, `--peer-ips` is only passed to the `flynn-host bootstrap` command on the last node, which coordinates starting discoverd (omni), flannel (omni), and all services across all hosts.
+
 - [x] Create a new Vagrantfile (libvirt provider, Debian 13, configurable 1 or 3+ nodes, private network, Flynn provisioning)
 - [x] Test single-node `flynn-host bootstrap` in a Vagrant VM — **all services healthy** (2026-04-13)
-- [ ] Test 3-node cluster bootstrap with `--peer-ips` and `--min-hosts=3`
+- [x] Update Vagrantfile for multi-node: auto-scale RAM (8 GB) and CPUs (4) for HA mode, document `--peer-ips` flow
+- [x] Test 3-node cluster bootstrap with `--peer-ips` and `--min-hosts=3` — **37 processes running across 3 nodes** (2026-04-14)
+
+#### HA Process Distribution (3-Node Cluster)
+
+In HA mode (min-hosts >= 3), Flynn deploys ~37 processes across the cluster. Services marked "omni" run one instance per host; others are distributed by the scheduler (load-balanced by job count).
+
+| Service | Process | Count | Omni? |
+|---|---|---|---|
+| discoverd | app | 3 | yes |
+| flannel | app | 3 | yes |
+| postgres | postgres | 3 | |
+| postgres | web | 2 | |
+| controller | web | 2 | |
+| controller | scheduler | 3 | yes |
+| controller | worker | 2 | |
+| router | app | 3 | yes |
+| redis | web | 2 | |
+| mariadb | web | 2 | |
+| mongodb | web | 2 | |
+| blobstore | web | 2 | |
+| gitreceive | app | 2 | |
+| tarreceive | app | 2 | |
+| logaggregator | app | 2 | |
+| status | web | 2 | |
+| **Total** | | **~37** | |
 
 ### Component Bootstrap (Single-Node Complete)
 
@@ -259,16 +289,25 @@ The following patches were required to make Flynn run on Debian 13 (kernel 6.12,
 
 **Build requirements**: All binaries destined for container images must be built with `CGO_ENABLED=0` (static linking). The container base is Ubuntu 18.04 Bionic (glibc 2.27); the dev machine has glibc 2.40+. Dynamically-linked binaries fail with `GLIBC_2.34 not found`.
 
+#### Bugs Found and Fixed During 3-Node Bootstrap (2026-04-14)
+
+**1. PostgreSQL `uuid-ossp` read-only transaction error** (`appliance/postgresql/process.go`): When postgres runs with a sync replica, `postgresql.conf` sets `default_transaction_read_only = on`. The `installExtensionsInTemplate()` function opens a new connection to `template1` to run `CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`, but doesn't override the read-only setting. The DDL fails with `SQLSTATE 25006` (read-only transaction), causing the primary to crash-loop. **Fix**: Added `SET default_transaction_read_only = off` at the start of `installExtensionsInTemplate()` (line ~460). The existing `assumePrimary()` function already does `SET TRANSACTION READ WRITE` but that session-level override doesn't carry over to the extension installation's separate connection.
+
+**2. Flannel VXLAN duplicate MAC addresses** (`flannel/backend/vxlan/device.go`): All VMs cloned from the same Vagrant base box get identical `flannel.1` VXLAN device MAC addresses (e.g., `22:06:d8:56:99:5b` on all 3 nodes). This is because: (a) the code never sets `HardwareAddr` in the VXLAN `LinkAttrs`, (b) the vendored netlink library has a TODO and doesn't send `IFLA_ADDRESS` during `LinkAdd`, and (c) the kernel generates the MAC deterministically from the VNI and machine state, which is identical on cloned VMs. With duplicate MACs, VXLAN FDB entries can't distinguish remote nodes, causing 100% packet loss on the overlay network. **Fix**: Added `netlink.LinkSetHardwareAddr()` call after device creation in `newVXLANDevice()` to set a unique MAC derived from the VTEP IP (`02:42:IP[0]:IP[1]:IP[2]:IP[3]`). This produces unique MACs like `02:42:c0:a8:32:0b` for 192.168.50.11.
+
+**3. vagrant-libvirt premature provisioner bug**: `NUM_NODES=3 vagrant up --no-parallel` doesn't work reliably. During long-running DKMS builds (~5 min), vagrant-libvirt prematurely triggers the next provisioner or starts the next VM before the current one finishes. **Workaround**: Provision each node individually with `NUM_NODES=3 AUTO_BOOTSTRAP=false vagrant up node1`, then `vagrant up node2`, then `vagrant up node3`.
+
 #### TUF Image Rebuilds
 
 | Image | Layers | Change |
 |---|---|---|
-| postgres | 3: base (`33121091`) + packages (`d0f9b319`, 71MB) + binaries (`f4232c7c`, 11MB) | Added PostgreSQL 11 packages layer; rebuilt binaries with `CGO_ENABLED=0` and extension fixes |
+| postgres | 3: base (`33121091`) + packages (`d0f9b319`, 71MB) + binaries (`f4232c7c`, 11MB) | Added PostgreSQL 11 packages layer; rebuilt binaries with `CGO_ENABLED=0` and extension fixes; added `SET default_transaction_read_only = off` for multi-node |
 | controller | 2: base (`03fe7735`) + binaries+schemas (`e8a66adf`, 20MB) | Rebuilt with `CGO_ENABLED=0`; added `/etc/flynn-controller/jsonschema/` (was missing, caused nil pointer crash) |
+| flannel | 2: base (`03fe7735`) + binaries (`9d2da31c`, 11MB) | Rebuilt `flanneld` with `CGO_ENABLED=0` and unique VXLAN MAC fix |
 
 ### Remaining Phase 6 Work
 
-- [ ] Test 3-node cluster bootstrap with `--peer-ips` and `--min-hosts=3`
+- [x] Test 3-node cluster bootstrap with `--peer-ips` and `--min-hosts=3` — complete (2026-04-14), 37 processes across 3 nodes; mariadb/mongodb/router reported unhealthy at status-check but all processes running
 - [ ] Re-enable integration tests (`script/run-integration-tests`)
 - [ ] Validate database appliances (PostgreSQL, MariaDB, MongoDB, Redis) — start/stop, data persistence, failover
 - [ ] Restore pgextwlist and TimescaleDB support (see below)

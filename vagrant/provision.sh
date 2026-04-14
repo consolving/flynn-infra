@@ -20,6 +20,7 @@ set -eo pipefail
 NODE_IP=""
 REPO_URL=""
 LOCAL_BINARY=""
+PEER_IPS=""
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -35,6 +36,10 @@ while [[ $# -gt 0 ]]; do
 		LOCAL_BINARY="$2"
 		shift 2
 		;;
+	--peer-ips)
+		PEER_IPS="$2"
+		shift 2
+		;;
 	*)
 		echo "Unknown argument: $1" >&2
 		exit 1
@@ -43,7 +48,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$NODE_IP" ]] || [[ -z "$REPO_URL" ]]; then
-	echo "Usage: provision.sh --node-ip IP --repo-url URL [--local-binary PATH]" >&2
+	echo "Usage: provision.sh --node-ip IP --repo-url URL [--local-binary PATH] [--peer-ips IP1,IP2,...]" >&2
 	exit 1
 fi
 
@@ -109,25 +114,53 @@ install_packages() {
 		fi
 	fi
 
-	apt-get update -qq
+	apt-get update
 
-	info "Installing dependencies..."
-	DEBIAN_FRONTEND=noninteractive apt-get install -y \
+	# --- Phase 1: Install non-DKMS packages (fast, no kernel compilation) ---
+	info "Installing non-DKMS dependencies..."
+	DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+		apt-get install -y \
 		iptables \
-		zfsutils-linux \
-		zfs-dkms \
-		linux-headers-$(uname -r) \
 		curl \
 		coreutils \
 		e2fsprogs \
-		squashfs-tools \
-		>/dev/null
+		squashfs-tools
+
+	# --- Phase 2: Install DKMS/ZFS packages ---
+	# The zfs-dkms package triggers a kernel module compilation during
+	# dpkg --configure that takes 4-6 minutes.  The DKMS pre_build script
+	# prints dots to stdout, so as long as we don't suppress output, the
+	# SSH session stays alive.
+	info "Installing ZFS/DKMS packages (kernel module build takes ~5 minutes)..."
+
+	local apt_rc=0
+	DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+		apt-get install -y \
+		-o Dpkg::Use-Pty=0 \
+		linux-headers-$(uname -r) \
+		zfsutils-linux \
+		zfs-dkms || apt_rc=$?
+
+	if [[ $apt_rc -ne 0 ]]; then
+		fail "apt-get install of ZFS/DKMS packages failed (exit code $apt_rc)"
+	fi
+	info "ZFS/DKMS packages installed successfully"
 
 	# Build and load ZFS kernel module (DKMS builds it from source)
 	info "Loading ZFS kernel module..."
 	if ! modprobe zfs 2>/dev/null; then
 		info "Building ZFS module via DKMS (first time, may take a minute)..."
-		dkms autoinstall 2>&1 | tail -5
+
+		# Run dkms autoinstall in the foreground with stdout passthrough.
+		# This keeps the SSH session alive and avoids the background process
+		# pattern that causes Vagrant to prematurely terminate the provisioner
+		# on multi-node clusters.
+		local dkms_rc=0
+		dkms autoinstall 2>&1 || dkms_rc=$?
+
+		if [[ $dkms_rc -ne 0 ]]; then
+			fail "DKMS autoinstall failed (exit code $dkms_rc)"
+		fi
 		modprobe zfs || fail "ZFS module failed to load after DKMS build"
 	fi
 	info "ZFS module loaded: $(cat /sys/module/zfs/version 2>/dev/null || echo 'version unknown')"
@@ -278,9 +311,9 @@ install_flynn() {
 		info "Downloading flynn-host binary..."
 		local tmp
 		tmp="$(mktemp -d)"
-		trap "rm -rf $tmp" RETURN
 
 		if ! curl -fsSL -o "$tmp/flynn-host.gz" "${REPO_URL}/targets/flynn-host.gz"; then
+			rm -rf "$tmp"
 			fail "Failed to download flynn-host from ${REPO_URL}"
 		fi
 
@@ -308,6 +341,9 @@ install_flynn() {
 
 	info "Flynn components installed"
 	flynn-host version
+
+	# Clean up temp directory if we downloaded from TUF
+	[[ -n "${tmp:-}" ]] && rm -rf "$tmp"
 }
 
 # --- Step 7: Install systemd unit ---------------------------------------------
@@ -323,6 +359,12 @@ install_systemd_unit() {
 	info "Installing flynn-host systemd unit..."
 
 	# Determine daemon flags
+	# NOTE: --peer-ips is intentionally NOT passed to the daemon for initial
+	# cluster bootstrap. The daemon's ConnectPeer() is for joining an existing
+	# cluster where discoverd is already running on peers. For fresh cluster
+	# formation, the bootstrap command handles peer coordination directly.
+	# Passing --peer-ips here would cause the daemon to block for ~60s per
+	# unreachable peer during ConnectPeer(), delaying startup.
 	local daemon_args="daemon --external-ip=${NODE_IP} --listen-ip=0.0.0.0"
 
 	cat >"$unit_file" <<EOF
@@ -360,12 +402,41 @@ EOF
 	info "flynn-host service enabled (not started — bootstrap will start it)"
 }
 
+# --- Step 8: Start the daemon -------------------------------------------------
+
+start_daemon() {
+	info "Starting flynn-host daemon..."
+
+	# Ensure systemd has picked up the unit file we just wrote
+	systemctl daemon-reload
+
+	systemctl start flynn-host.service
+
+	# Wait for the local API to be ready
+	local max_attempts=30
+	for attempt in $(seq 1 "$max_attempts"); do
+		if curl -sf "http://${NODE_IP}:1113/host/status" >/dev/null 2>&1; then
+			info "flynn-host API is ready on ${NODE_IP}"
+			return 0
+		fi
+		info "  waiting for flynn-host API (attempt ${attempt}/${max_attempts})..."
+		sleep 2
+	done
+
+	warn "flynn-host API did not become ready — dumping journal:"
+	journalctl -u flynn-host --no-pager -n 50
+	fail "flynn-host API did not become ready on ${NODE_IP}"
+}
+
 # --- Main ---------------------------------------------------------------------
 
 main() {
 	info "Provisioning Flynn node"
 	info "  Node IP:   $NODE_IP"
 	info "  Repo URL:  $REPO_URL"
+	if [[ -n "$PEER_IPS" ]]; then
+		info "  Peer IPs:  $PEER_IPS"
+	fi
 	info ""
 
 	# Step 1: Verify cgroups
@@ -389,10 +460,14 @@ main() {
 	# Step 7: Install systemd unit
 	install_systemd_unit
 
+	# Step 8: Start the daemon and verify the API is reachable
+	# This is done inside provision.sh (not as a separate Vagrant provisioner)
+	# to avoid a Vagrant/libvirt bug where the shell provisioner on node2/node3
+	# gets prematurely terminated during long-running DKMS builds.
+	start_daemon
+
 	info ""
-	info "Provisioning complete!"
-	info "  flynn-host is installed but NOT running."
-	info "  The bootstrap provisioner will start it and run cluster bootstrap."
+	info "Provisioning complete — flynn-host daemon is running on ${NODE_IP}"
 }
 
 main
