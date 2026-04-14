@@ -286,6 +286,7 @@ The following patches were required to make Flynn run on Debian 13 (kernel 6.12,
 | `vendor/.../dns/clientconfig.go` | Fix `len(s) >= 8` guard to `len(s) >= 9` before `s[:9]` | Debian 13 resolv.conf has `trust-ad` (8 chars), triggering panic |
 | `appliance/postgresql/cmd/flynn-postgres/main.go` | `TimescaleDB: false`, `ExtWhitelist: false` | See "pgextwlist / TimescaleDB restoration" below |
 | `appliance/postgresql/process.go` | `installExtensionsInTemplate()` — pre-installs `uuid-ossp` and `pgcrypto` in template1 | Non-superuser app DB users can't run CREATE EXTENSION without pgextwlist |
+| `router/server.go` | Use `EXTERNAL_IP` for discoverd registration, `LISTEN_IP` for bind only | Router registered `0.0.0.0:5000` with discoverd, unreachable from other nodes |
 
 **Build requirements**: All binaries destined for container images must be built with `CGO_ENABLED=0` (static linking). The container base is Ubuntu 18.04 Bionic (glibc 2.27); the dev machine has glibc 2.40+. Dynamically-linked binaries fail with `GLIBC_2.34 not found`.
 
@@ -297,6 +298,8 @@ The following patches were required to make Flynn run on Debian 13 (kernel 6.12,
 
 **3. vagrant-libvirt premature provisioner bug**: `NUM_NODES=3 vagrant up --no-parallel` doesn't work reliably. During long-running DKMS builds (~5 min), vagrant-libvirt prematurely triggers the next provisioner or starts the next VM before the current one finishes. **Workaround**: Provision each node individually with `NUM_NODES=3 AUTO_BOOTSTRAP=false vagrant up node1`, then `vagrant up node2`, then `vagrant up node3`.
 
+**4. Router discoverd registration with 0.0.0.0** (`router/server.go`): The router registers its `router-api` and `router-http` services with discoverd using `LISTEN_IP` (set to `0.0.0.0` by `flynn-host --listen-ip=0.0.0.0`) instead of `EXTERNAL_IP` (set to the node's real IP). This produces registrations like `0.0.0.0:5000` which are not routable from other nodes. The status aggregator can't reach the router's `/.well-known/status` endpoint, and the scheduler can't connect to router event streams (producing continuous "route not found" errors). **Fix**: Changed `server.go` to use `EXTERNAL_IP` for discoverd registration addresses while keeping `LISTEN_IP` for bind addresses. Now registers as `192.168.50.x:5000` / `192.168.50.x:80`.
+
 #### TUF Image Rebuilds
 
 | Image | Layers | Change |
@@ -304,16 +307,17 @@ The following patches were required to make Flynn run on Debian 13 (kernel 6.12,
 | postgres | 3: base (`33121091`) + packages (`d0f9b319`, 71MB) + binaries (`f4232c7c`, 11MB) | Added PostgreSQL 11 packages layer; rebuilt binaries with `CGO_ENABLED=0` and extension fixes; added `SET default_transaction_read_only = off` for multi-node |
 | controller | 2: base (`03fe7735`) + binaries+schemas (`e8a66adf`, 20MB) | Rebuilt with `CGO_ENABLED=0`; added `/etc/flynn-controller/jsonschema/` (was missing, caused nil pointer crash) |
 | flannel | 2: base (`03fe7735`) + binaries (`9d2da31c`, 11MB) | Rebuilt `flanneld` with `CGO_ENABLED=0` and unique VXLAN MAC fix |
+| router | 2: base (`03fe7735`) + binaries (`60cd196b`, 5.6MB) | Rebuilt `flynn-router` with `CGO_ENABLED=0` and `EXTERNAL_IP` registration fix |
 
 ### Remaining Phase 6 Work
 
 - [x] Test 3-node cluster bootstrap with `--peer-ips` and `--min-hosts=3` — complete (2026-04-14), 37 processes across 3 nodes; mariadb/mongodb/router reported unhealthy at status-check but all processes running
+- [x] Fix router discoverd registration — router now registers with `EXTERNAL_IP` instead of `LISTEN_IP`, all non-optional services healthy (2026-04-14)
 - [ ] Re-enable integration tests (`script/run-integration-tests`)
 - [ ] Validate database appliances (PostgreSQL, MariaDB, MongoDB, Redis) — start/stop, data persistence, failover
 - [ ] Restore pgextwlist and TimescaleDB support (see below)
 - [ ] Build missing packages layers for remaining images (redis, mariadb, mongodb, gitreceive, taffy)
 - [ ] Publish patched `flynn-host` binary via TUF (currently deployed manually)
-- [ ] Update `implementation-plan.md` with all fixes after stabilization
 
 #### pgextwlist / TimescaleDB Restoration
 
