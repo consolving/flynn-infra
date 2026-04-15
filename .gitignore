@@ -21,3 +21,6 @@ vagrant/.vagrant/
 
 # OpenCode local state
 .opencode/
+
+# Local binaries and cluster config
+bin/
