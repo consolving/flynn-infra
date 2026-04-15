@@ -75,6 +75,11 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
   # takes 4+ minutes with no stdout when output is suppressed).
   config.ssh.keep_alive = true
 
+  # Generous boot timeout to allow for slow DKMS kernel module builds
+  # during provisioning (ZFS DKMS takes 4-6 minutes).
+  config.vm.boot_timeout = 900            # seconds to wait for VM to boot
+  config.vm.graceful_halt_timeout = 120   # seconds to wait for graceful shutdown
+
   # Disable default synced folder (not needed, avoids rsync/nfs issues)
   config.vm.synced_folder ".", "/vagrant", disabled: true
 
@@ -96,6 +101,11 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
         libvirt.driver = "kvm"
         libvirt.memory = NODE_MEMORY
         libvirt.cpus   = NODE_CPUS
+
+        # Assign a deterministic MAC on the management network so each VM
+        # gets a unique DHCP lease.  Without this, vagrant-libvirt can hand
+        # the same IP to multiple VMs in multi-node setups, which breaks SSH.
+        libvirt.management_network_mac = "52:54:00:FE:00:%02X" % i
 
         # Additional disk for ZFS pool
         libvirt.storage :file,

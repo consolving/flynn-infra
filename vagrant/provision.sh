@@ -240,13 +240,10 @@ setup_networking() {
 	fi
 
 	# Assign NODE_IP to the private network interface.
-	# Vagrant/libvirt creates the interface (ens7) but Debian 13's networkd
-	# doesn't always assign the static IP configured in the Vagrantfile.
-	# We detect the interface by finding the one that is UP but has no IPv4.
-	if ip addr show | grep -q "inet ${NODE_IP}/"; then
-		info "IP ${NODE_IP} already assigned"
-		return 0
-	fi
+	# Vagrant/libvirt + Debian 13 networkd creates conflicting config files:
+	#   10-ens7.network  — written by Vagrant's network config step (wrong IP, off-by-one)
+	#   50-vagrant-ens7.network — also Vagrant (correct IP but lower priority)
+	# We consolidate into a single file with the correct IP.
 
 	# Find the private network interface: second non-loopback interface (ens7 or similar)
 	local priv_iface=""
@@ -267,8 +264,23 @@ setup_networking() {
 		priv_iface="ens7"
 	fi
 
+	# Remove all conflicting networkd configs for this interface and write
+	# a single authoritative one.
+	rm -f /etc/systemd/network/10-${priv_iface}.network \
+	      /etc/systemd/network/50-vagrant-${priv_iface}.network
+	cat > /etc/systemd/network/10-${priv_iface}.network <<-NETEOF
+	[Match]
+	Name=${priv_iface}
+
+	[Network]
+	Address=${NODE_IP}/24
+	NETEOF
+
+	# Flush any stale IPs and apply the correct one immediately
 	info "Assigning ${NODE_IP}/24 to ${priv_iface}..."
+	ip addr flush dev "${priv_iface}" 2>/dev/null || true
 	ip addr add "${NODE_IP}/24" dev "${priv_iface}" 2>/dev/null || true
+	systemctl restart systemd-networkd 2>/dev/null || true
 
 	# Verify
 	if ip addr show "${priv_iface}" | grep -q "inet ${NODE_IP}/"; then
@@ -277,17 +289,17 @@ setup_networking() {
 		fail "Failed to assign ${NODE_IP} to ${priv_iface}"
 	fi
 
-	# Make it persistent via networkd drop-in (no restart needed — IP is already live)
-	mkdir -p /etc/systemd/network
-	cat >"/etc/systemd/network/10-${priv_iface}.network" <<EOF
-[Match]
-Name=${priv_iface}
-
-[Network]
-Address=${NODE_IP}/24
-EOF
-	# Reload (not restart) to pick up the drop-in without disrupting DNS
-	networkctl reload 2>/dev/null || true
+	# Fix DNS resolution for containers: Debian 13's /etc/resolv.conf is a
+	# symlink to systemd-resolved's stub resolver (127.0.0.53). flynn-host reads
+	# /etc/resolv.conf to find upstream DNS servers for discoverd's recursor. But
+	# 127.0.0.53 is on the host's loopback and unreachable from containers running
+	# in separate network namespaces. Point /etc/resolv.conf at systemd-resolved's
+	# upstream resolver list instead, which contains the real DNS server IPs.
+	if [[ -L /etc/resolv.conf ]] && readlink /etc/resolv.conf | grep -q "stub-resolv"; then
+		info "Fixing /etc/resolv.conf: replacing stub-resolv.conf symlink with upstream resolver list"
+		rm -f /etc/resolv.conf
+		ln -s /run/systemd/resolve/resolv.conf /etc/resolv.conf
+	fi
 }
 
 # --- Step 6: Download and install Flynn ---------------------------------------
