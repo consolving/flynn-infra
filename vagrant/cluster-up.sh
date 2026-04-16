@@ -208,15 +208,33 @@ NODE1_VDB=$(virsh domblklist "$VAGRANT_VM" 2>/dev/null | awk '/vdb/ {print $2}')
 [[ -z "$NODE1_VDB" ]] && fail "Cannot find node1 vdb disk"
 info "  Node1 disks: vda=$NODE1_VDA  vdb=$NODE1_VDB"
 
-# Read the flynn-host service file template from node1's disk.
-# We modify the external-ip for each clone. Reading once avoids N guestfish
-# invocations just to get the template.
-info "  Reading flynn-host.service template from node1 disk..."
-SVC_TEMPLATE=$(guestfish --ro -a "$NODE1_VDA" run : mount /dev/sda1 / \
-    : cat /lib/systemd/system/flynn-host.service 2>/dev/null) \
-    || fail "Cannot read flynn-host.service from node1 disk"
+# Read the flynn-host service file template from node1.
+# We modify the external-ip for each clone. Reading once avoids N lookups.
+# Try SSH first (works when VM is running), fall back to guestfish (offline).
+info "  Reading flynn-host.service template from node1..."
+SVC_TEMPLATE=$(ssh $SSH_OPTS vagrant@"$NODE1_IP" \
+    "sudo cat /lib/systemd/system/flynn-host.service" 2>/dev/null) \
+    || SVC_TEMPLATE=$(guestfish --ro -a "$NODE1_VDA" run : mount /dev/sda1 / \
+        : cat /lib/systemd/system/flynn-host.service 2>/dev/null) \
+    || fail "Cannot read flynn-host.service from node1"
 
-# Step 1: Create all disk copies
+# Step 1: Shut down node1 to release disk locks for cloning.
+# QEMU 10+ uses mandatory OFD file locking, so we can't copy or read
+# disk files while the VM is running (unless the host FS supports reflink).
+info "  Shutting down node1 for disk cloning..."
+virsh shutdown "$VAGRANT_VM" 2>/dev/null || true
+for attempt in $(seq 1 30); do
+    if ! virsh domstate "$VAGRANT_VM" 2>/dev/null | grep -q "running"; then
+        break
+    fi
+    sleep 1
+done
+if virsh domstate "$VAGRANT_VM" 2>/dev/null | grep -q "running"; then
+    virsh destroy "$VAGRANT_VM" 2>/dev/null || true
+    sleep 2
+fi
+
+# Step 2: Create all disk copies
 info "  Creating disk copies..."
 COPY_START=$(date +%s)
 for i in $(seq 2 "$NUM_NODES"); do
@@ -262,6 +280,26 @@ Address=${target_ip}/24
 NETEOF
 done
 
+# ZFS import service: force-imports the pool from /dev/vdb at boot.
+# Clones inherit node1's pool on vdb but the zpool.cache is cleared,
+# so standard import services won't find it.
+cat > "${WORK_DIR}/zfs-import-flynn.service" <<'ZFSEOF'
+[Unit]
+Description=Import Flynn ZFS pool from /dev/vdb
+DefaultDependencies=no
+Before=zfs-mount.service flynn-host.service
+After=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/rm -f /var/lib/flynn/volumes/zfs/vdev/flynn-default-zpool.vdev
+ExecStart=/sbin/zpool import -f -d /dev flynn-default
+
+[Install]
+WantedBy=zfs-mount.service
+ZFSEOF
+
 # Step 3: Offline customization via guestfish (parallel)
 info "  Customizing clone disks via guestfish (parallel)..."
 GF_START=$(date +%s)
@@ -300,10 +338,13 @@ rm-f /var/lib/flynn/host-state.bolt
 rm-rf /var/lib/flynn/discoverd-data
 rm-f /etc/flynn/resolv.conf
 
-# The zfs-import-flynn.service (inherited from node1) handles
-# force-importing the ZFS pool from /dev/vdb at boot time.
-# It also deletes the file-based vdev that flynn-host would
-# otherwise create, preventing pool GUID conflicts.
+# Remove file-based vdev so flynn-host doesn't try to use it
+rm-f /var/lib/flynn/volumes/zfs/vdev/flynn-default-zpool.vdev
+
+# Install ZFS import service to force-import pool from /dev/vdb
+upload ${WORK_DIR}/zfs-import-flynn.service /lib/systemd/system/zfs-import-flynn.service
+mkdir-p /etc/systemd/system/zfs-mount.service.wants
+ln-sf /lib/systemd/system/zfs-import-flynn.service /etc/systemd/system/zfs-mount.service.wants/zfs-import-flynn.service
 GFEOF
         echo "    node${i}: guestfish done"
     ) &
@@ -376,11 +417,12 @@ info "Phase 2 complete: $((NUM_NODES - 1)) clones created and customized ($(elap
 # Phase 3: Boot all clones and wait for flynn-host
 # ═══════════════════════════════════════════════════════════════════════════
 PHASE3_START=$(date +%s)
-info "Phase 3: Booting all clone nodes..."
+info "Phase 3: Booting all nodes..."
 
-# Start all clones simultaneously — no DHCP stagger needed since data IPs
-# are baked in. Management IPs come via DHCP but we don't need to discover
-# them; we connect via the data network.
+# Restart node1 (was shut down for cloning)
+virsh start "$VAGRANT_VM" 2>/dev/null || true
+
+# Start all clones simultaneously
 for i in $(seq 2 "$NUM_NODES"); do
     virsh start "$(vm_name "$i")"
 done
