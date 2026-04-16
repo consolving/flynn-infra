@@ -25,7 +25,7 @@
 #   - vagrant, vagrant-libvirt plugin
 #   - virsh, qemu-img, guestfish (libguestfs-tools)
 #   - Host filesystem must be ZFS (for reflink/block-clone support)
-#   - debian13-amd64 Vagrant box added
+#   - ubuntu-noble-amd64 Vagrant box added
 #
 set -euo pipefail
 
@@ -158,7 +158,7 @@ NODE1_IP="$(node_ip 1)"
 if [[ -n "$VAGRANT_VM" ]] && wait_for_flynn "$NODE1_IP" 3; then
     info "Phase 1: node1 already running at $NODE1_IP — skipping Vagrant build"
 else
-    info "Phase 1: Building golden node1 via Vagrant (DKMS build, ~7 min)..."
+    info "Phase 1: Building golden node1 via Vagrant (~3 min)..."
     PHASE1_START=$(date +%s)
 
     (
