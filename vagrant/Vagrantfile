@@ -29,12 +29,8 @@ VAGRANTFILE_API_VERSION = "2"
 NUM_NODES       = (ENV["NUM_NODES"] || "1").to_i
 
 # Resources per node
-# Multi-node HA runs ~13 jobs per node at 1 GiB default each.
-# 4 GB is fine for single-node (singleton reduces to ~16 processes total).
-# 8 GB gives headroom for HA (13 × 1 GiB + OS overhead).
-DEFAULT_MEMORY  = NUM_NODES > 1 ? 8192 : 4096
-NODE_MEMORY     = (ENV["NODE_MEMORY"] || DEFAULT_MEMORY.to_s).to_i  # MB
-NODE_CPUS       = (ENV["NODE_CPUS"] || (NUM_NODES > 1 ? "4" : "2")).to_i
+NODE_MEMORY     = (ENV["NODE_MEMORY"] || "4096").to_i  # MB
+NODE_CPUS       = (ENV["NODE_CPUS"] || "4").to_i
 NODE_DISK_SIZE  = (ENV["NODE_DISK_SIZE"] || "40").to_i  # GB, for ZFS pool
 
 # Networking

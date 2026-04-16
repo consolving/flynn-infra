@@ -300,6 +300,25 @@ setup_networking() {
 		rm -f /etc/resolv.conf
 		ln -s /run/systemd/resolve/resolv.conf /etc/resolv.conf
 	fi
+
+	# Wait for DNS resolution to be available after the networkd restart and
+	# resolv.conf swap above. Without this, the immediately following
+	# install_flynn download can fail with "Could not resolve host".
+	info "Waiting for DNS resolution to become available..."
+	local dns_attempts=0
+	local dns_max=15
+	while [[ $dns_attempts -lt $dns_max ]]; do
+		if getent hosts github.io >/dev/null 2>&1; then
+			info "DNS resolution OK"
+			break
+		fi
+		dns_attempts=$((dns_attempts + 1))
+		info "  DNS not ready yet (attempt ${dns_attempts}/${dns_max})..."
+		sleep 2
+	done
+	if [[ $dns_attempts -ge $dns_max ]]; then
+		warn "DNS resolution may not be working — continuing anyway"
+	fi
 }
 
 # --- Step 6: Download and install Flynn ---------------------------------------
@@ -440,6 +459,41 @@ start_daemon() {
 	fail "flynn-host API did not become ready on ${NODE_IP}"
 }
 
+# --- Step 0: Ensure unique machine-id -----------------------------------------
+#
+# VMs cloned from the same Vagrant base box share /etc/machine-id.
+# This causes identical DHCP client-IDs and identical VXLAN interface MACs.
+# The kernel derives the MAC for VXLAN interfaces (e.g. flannel.1) from
+# machine-id, so all cloned VMs get the same MAC on their overlay interfaces.
+# This breaks VXLAN forwarding: the receiving kernel sees its own MAC as the
+# source and silently drops the decapsulated frames.
+
+ensure_unique_machine_id() {
+	local current_id
+	current_id=$(cat /etc/machine-id 2>/dev/null || true)
+
+	# Check if all nodes would have the same machine-id by testing
+	# if it matches the base box's default. We regenerate unconditionally
+	# to be safe — systemd-machine-id-setup generates a new random ID.
+	if [[ -n "$current_id" ]]; then
+		info "Current machine-id: $current_id"
+		# Use a marker file to avoid regenerating on re-provision
+		if [[ -f /etc/machine-id.flynn-regenerated ]]; then
+			info "Machine-id already regenerated (marker exists), skipping"
+			return 0
+		fi
+	fi
+
+	info "Regenerating unique machine-id..."
+	rm -f /etc/machine-id
+	systemd-machine-id-setup
+	touch /etc/machine-id.flynn-regenerated
+
+	local new_id
+	new_id=$(cat /etc/machine-id)
+	info "New machine-id: $new_id"
+}
+
 # --- Main ---------------------------------------------------------------------
 
 main() {
@@ -450,6 +504,14 @@ main() {
 		info "  Peer IPs:  $PEER_IPS"
 	fi
 	info ""
+
+	# Step 0: Ensure unique machine-id
+	# VMs cloned from the same base box image share the same /etc/machine-id.
+	# This causes:
+	#   - DHCP IP collisions (identical client-id)
+	#   - VXLAN MAC duplicates (kernel derives flannel.1 MAC from machine-id)
+	# Regenerate a unique machine-id on each node to prevent these issues.
+	ensure_unique_machine_id
 
 	# Step 1: Verify cgroups
 	verify_cgroups
