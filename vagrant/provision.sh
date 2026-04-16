@@ -327,7 +327,9 @@ install_flynn() {
 	flynn-host version
 
 	# Clean up temp directory if we downloaded from TUF
-	[[ -n "${tmp:-}" ]] && rm -rf "$tmp"
+	if [[ -n "${tmp:-}" ]]; then
+		rm -rf "$tmp"
+	fi
 }
 
 # --- Step 7: Install systemd unit ---------------------------------------------
