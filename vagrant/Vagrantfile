@@ -1,7 +1,7 @@
 # -*- mode: ruby -*-
 # vi: set ft=ruby :
 #
-# Flynn Cluster Vagrantfile (libvirt provider, Debian 13)
+# Flynn Cluster Vagrantfile (libvirt provider, Ubuntu Noble 24.04)
 #
 # Usage:
 #   Single-node:   vagrant up node1
@@ -14,10 +14,10 @@
 # Requirements:
 #   - vagrant-libvirt plugin
 #   - KVM acceleration (/dev/kvm)
-#   - debian13-amd64 box added: vagrant box add debian13-amd64 /path/to/debian13-amd64.box
+#   - ubuntu-noble-amd64 box added: vagrant box add ubuntu-noble-amd64 /root/vagrant-boxes/ubuntu-noble-amd64.box
 #
 # On the x86_64 dev-machine (192.168.168.87):
-#   vagrant box add debian13-amd64 /root/vagrant-boxes/debian13-amd64.box
+#   vagrant box add ubuntu-noble-amd64 /root/vagrant-boxes/ubuntu-noble-amd64.box
 #   cd /path/to/this/directory && vagrant up
 #
 
@@ -63,17 +63,11 @@ end
 # --- VM definitions -----------------------------------------------------------
 
 Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
-  config.vm.box = "debian13-amd64"
+  config.vm.box = "ubuntu-noble-amd64"
   config.ssh.insert_key = false
 
-  # Increase SSH keep-alive frequency to prevent Vagrant from killing
-  # long-running provisioners (e.g., DKMS ZFS kernel module compilation
-  # takes 4+ minutes with no stdout when output is suppressed).
   config.ssh.keep_alive = true
-
-  # Generous boot timeout to allow for slow DKMS kernel module builds
-  # during provisioning (ZFS DKMS takes 4-6 minutes).
-  config.vm.boot_timeout = 900            # seconds to wait for VM to boot
+  config.vm.boot_timeout = 600            # seconds to wait for VM to boot
   config.vm.graceful_halt_timeout = 120   # seconds to wait for graceful shutdown
 
   # Disable default synced folder (not needed, avoids rsync/nfs issues)

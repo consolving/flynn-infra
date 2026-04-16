@@ -1,10 +1,10 @@
 #!/bin/bash
 #
-# Flynn node provisioning script for Debian 13 (Trixie)
+# Flynn node provisioning script for Ubuntu Noble (24.04 LTS)
 #
-# This script prepares a Debian 13 VM to run flynn-host:
-#   1. Verifies cgroups v2 (Debian 13 has v1 compiled out)
-#   2. Installs ZFS, iptables, and other dependencies
+# This script prepares an Ubuntu Noble VM to run flynn-host:
+#   1. Verifies cgroups v2
+#   2. Installs ZFS (native kernel module), iptables, and other dependencies
 #   3. Creates a ZFS pool on /dev/vdb
 #   4. Assigns the private network IP to the cluster interface
 #   5. Downloads and installs Flynn binaries from the TUF repository
@@ -68,11 +68,6 @@ fail() {
 }
 
 # --- Step 1: Verify cgroups ---------------------------------------------------
-#
-# Flynn has been patched to support both cgroups v1 and v2.
-# Debian 13's kernel (6.12+) has CONFIG_MEMCG_V1=n / CONFIG_CPUSETS_V1=n,
-# meaning cgroups v1 is compiled OUT — only v2 is available.
-# We verify the required v2 controllers are present.
 
 verify_cgroups() {
 	info "Checking cgroups version..."
@@ -82,7 +77,6 @@ verify_cgroups() {
 		controllers=$(cat /sys/fs/cgroup/cgroup.controllers)
 		info "cgroups v2 unified mode — controllers: $controllers"
 
-		# Verify essential controllers are available
 		for ctl in cpu memory pids; do
 			if ! echo "$controllers" | grep -qw "$ctl"; then
 				fail "Required cgroup v2 controller '$ctl' not available"
@@ -102,67 +96,28 @@ verify_cgroups() {
 install_packages() {
 	info "Updating package lists..."
 
-	# Enable contrib and non-free repos (ZFS is in contrib)
-	if ! grep -q "contrib" /etc/apt/sources.list.d/*.sources 2>/dev/null &&
-		! grep -q "contrib" /etc/apt/sources.list 2>/dev/null; then
-		info "Enabling contrib repository for ZFS..."
-		# Debian 13 uses deb822 format in /etc/apt/sources.list.d/
-		if [[ -f /etc/apt/sources.list.d/debian.sources ]]; then
-			sed -i 's/^Components: main$/Components: main contrib/' /etc/apt/sources.list.d/debian.sources
-		elif [[ -f /etc/apt/sources.list ]]; then
-			sed -i 's/main$/main contrib/' /etc/apt/sources.list
-		fi
+	# Ensure universe repo is enabled (ZFS is in universe on Ubuntu)
+	if ! apt-cache policy 2>/dev/null | grep -q "universe"; then
+		info "Enabling universe repository..."
+		apt-get install -y software-properties-common
+		add-apt-repository -y universe
 	fi
 
 	apt-get update
 
-	# --- Phase 1: Install non-DKMS packages (fast, no kernel compilation) ---
-	info "Installing non-DKMS dependencies..."
+	info "Installing dependencies..."
 	DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
 		apt-get install -y \
 		iptables \
 		curl \
 		coreutils \
 		e2fsprogs \
-		squashfs-tools
+		squashfs-tools \
+		zfsutils-linux
 
-	# --- Phase 2: Install DKMS/ZFS packages ---
-	# The zfs-dkms package triggers a kernel module compilation during
-	# dpkg --configure that takes 4-6 minutes.  The DKMS pre_build script
-	# prints dots to stdout, so as long as we don't suppress output, the
-	# SSH session stays alive.
-	info "Installing ZFS/DKMS packages (kernel module build takes ~5 minutes)..."
-
-	local apt_rc=0
-	DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
-		apt-get install -y \
-		-o Dpkg::Use-Pty=0 \
-		linux-headers-$(uname -r) \
-		zfsutils-linux \
-		zfs-dkms || apt_rc=$?
-
-	if [[ $apt_rc -ne 0 ]]; then
-		fail "apt-get install of ZFS/DKMS packages failed (exit code $apt_rc)"
-	fi
-	info "ZFS/DKMS packages installed successfully"
-
-	# Build and load ZFS kernel module (DKMS builds it from source)
+	# Ubuntu Noble ships ZFS as a prebuilt kernel module — no DKMS needed.
 	info "Loading ZFS kernel module..."
-	if ! modprobe zfs 2>/dev/null; then
-		info "Building ZFS module via DKMS (first time, may take a minute)..."
-
-		# Run dkms autoinstall in the foreground with stdout passthrough.
-		# This keeps the SSH session alive and avoids the background process
-		# pattern that causes Vagrant to prematurely terminate the provisioner
-		# on multi-node clusters.
-		local dkms_rc=0
-		dkms autoinstall 2>&1 || dkms_rc=$?
-
-		if [[ $dkms_rc -ne 0 ]]; then
-			fail "DKMS autoinstall failed (exit code $dkms_rc)"
-		fi
-		modprobe zfs || fail "ZFS module failed to load after DKMS build"
-	fi
+	modprobe zfs || fail "ZFS module failed to load"
 	info "ZFS module loaded: $(cat /sys/module/zfs/version 2>/dev/null || echo 'version unknown')"
 }
 
@@ -239,20 +194,21 @@ setup_networking() {
 		sysctl -w net.bridge.bridge-nf-call-iptables=1 >/dev/null
 	fi
 
-	# Assign NODE_IP to the private network interface.
-	# Vagrant/libvirt + Debian 13 networkd creates conflicting config files:
-	#   10-ens7.network  — written by Vagrant's network config step (wrong IP, off-by-one)
-	#   50-vagrant-ens7.network — also Vagrant (correct IP but lower priority)
-	# We consolidate into a single file with the correct IP.
+	# Disable netplan and use systemd-networkd directly.
+	# Ubuntu Noble defaults to netplan, which can conflict with our static
+	# IP assignments. We bypass it entirely.
+	if command -v netplan &>/dev/null; then
+		info "Disabling netplan in favor of direct systemd-networkd control..."
+		# Remove netplan configs for the private interface to avoid conflicts
+		rm -f /etc/netplan/50-vagrant*.yaml 2>/dev/null || true
+	fi
 
-	# Find the private network interface: second non-loopback interface (ens7 or similar)
+	# Find the private network interface: second non-loopback interface
 	local priv_iface=""
 	for iface in $(ls /sys/class/net/ | grep -v lo | sort); do
-		# Skip the management interface (the one with a DHCP lease / default route)
 		if ip route show default | grep -q "dev ${iface}"; then
 			continue
 		fi
-		# This is likely the private network interface
 		if [[ -d "/sys/class/net/${iface}" ]] && ip link show "${iface}" | grep -q "state UP"; then
 			priv_iface="${iface}"
 			break
@@ -289,8 +245,8 @@ setup_networking() {
 		fail "Failed to assign ${NODE_IP} to ${priv_iface}"
 	fi
 
-	# Fix DNS resolution for containers: Debian 13's /etc/resolv.conf is a
-	# symlink to systemd-resolved's stub resolver (127.0.0.53). flynn-host reads
+	# Fix DNS resolution for containers: Ubuntu Noble's /etc/resolv.conf may be
+	# a symlink to systemd-resolved's stub resolver (127.0.0.53). flynn-host reads
 	# /etc/resolv.conf to find upstream DNS servers for discoverd's recursor. But
 	# 127.0.0.53 is on the host's loopback and unreachable from containers running
 	# in separate network namespaces. Point /etc/resolv.conf at systemd-resolved's
@@ -302,8 +258,7 @@ setup_networking() {
 	fi
 
 	# Wait for DNS resolution to be available after the networkd restart and
-	# resolv.conf swap above. Without this, the immediately following
-	# install_flynn download can fail with "Could not resolve host".
+	# resolv.conf swap above.
 	info "Waiting for DNS resolution to become available..."
 	local dns_attempts=0
 	local dns_max=15
@@ -334,11 +289,9 @@ install_flynn() {
 	local bootstrap_binary=""
 
 	if [[ -n "$LOCAL_BINARY" ]] && [[ -f "$LOCAL_BINARY" ]]; then
-		# Use a locally-provided patched flynn-host binary
 		info "Using local flynn-host binary: $LOCAL_BINARY"
 		bootstrap_binary="$LOCAL_BINARY"
 	else
-		# Download flynn-host from TUF repo
 		info "Downloading flynn-host binary..."
 		local tmp
 		tmp="$(mktemp -d)"
@@ -389,13 +342,6 @@ install_systemd_unit() {
 
 	info "Installing flynn-host systemd unit..."
 
-	# Determine daemon flags
-	# NOTE: --peer-ips is intentionally NOT passed to the daemon for initial
-	# cluster bootstrap. The daemon's ConnectPeer() is for joining an existing
-	# cluster where discoverd is already running on peers. For fresh cluster
-	# formation, the bootstrap command handles peer coordination directly.
-	# Passing --peer-ips here would cause the daemon to block for ~60s per
-	# unreachable peer during ConnectPeer(), delaying startup.
 	local daemon_args="daemon --external-ip=${NODE_IP} --listen-ip=0.0.0.0"
 
 	cat >"$unit_file" <<EOF
@@ -438,9 +384,7 @@ EOF
 start_daemon() {
 	info "Starting flynn-host daemon..."
 
-	# Ensure systemd has picked up the unit file we just wrote
 	systemctl daemon-reload
-
 	systemctl start flynn-host.service
 
 	# Wait for the local API to be ready
@@ -460,24 +404,13 @@ start_daemon() {
 }
 
 # --- Step 0: Ensure unique machine-id -----------------------------------------
-#
-# VMs cloned from the same Vagrant base box share /etc/machine-id.
-# This causes identical DHCP client-IDs and identical VXLAN interface MACs.
-# The kernel derives the MAC for VXLAN interfaces (e.g. flannel.1) from
-# machine-id, so all cloned VMs get the same MAC on their overlay interfaces.
-# This breaks VXLAN forwarding: the receiving kernel sees its own MAC as the
-# source and silently drops the decapsulated frames.
 
 ensure_unique_machine_id() {
 	local current_id
 	current_id=$(cat /etc/machine-id 2>/dev/null || true)
 
-	# Check if all nodes would have the same machine-id by testing
-	# if it matches the base box's default. We regenerate unconditionally
-	# to be safe — systemd-machine-id-setup generates a new random ID.
 	if [[ -n "$current_id" ]]; then
 		info "Current machine-id: $current_id"
-		# Use a marker file to avoid regenerating on re-provision
 		if [[ -f /etc/machine-id.flynn-regenerated ]]; then
 			info "Machine-id already regenerated (marker exists), skipping"
 			return 0
@@ -497,7 +430,7 @@ ensure_unique_machine_id() {
 # --- Main ---------------------------------------------------------------------
 
 main() {
-	info "Provisioning Flynn node"
+	info "Provisioning Flynn node (Ubuntu Noble 24.04)"
 	info "  Node IP:   $NODE_IP"
 	info "  Repo URL:  $REPO_URL"
 	if [[ -n "$PEER_IPS" ]]; then
@@ -505,39 +438,14 @@ main() {
 	fi
 	info ""
 
-	# Step 0: Ensure unique machine-id
-	# VMs cloned from the same base box image share the same /etc/machine-id.
-	# This causes:
-	#   - DHCP IP collisions (identical client-id)
-	#   - VXLAN MAC duplicates (kernel derives flannel.1 MAC from machine-id)
-	# Regenerate a unique machine-id on each node to prevent these issues.
 	ensure_unique_machine_id
-
-	# Step 1: Verify cgroups
 	verify_cgroups
-
-	# Step 2: Install packages
 	install_packages
-
-	# Step 3: Check OverlayFS
 	check_overlayfs
-
-	# Step 4: Create ZFS pool
 	setup_zfs
-
-	# Step 5: Configure networking
 	setup_networking
-
-	# Step 6: Download and install Flynn
 	install_flynn
-
-	# Step 7: Install systemd unit
 	install_systemd_unit
-
-	# Step 8: Start the daemon and verify the API is reachable
-	# This is done inside provision.sh (not as a separate Vagrant provisioner)
-	# to avoid a Vagrant/libvirt bug where the shell provisioner on node2/node3
-	# gets prematurely terminated during long-running DKMS builds.
 	start_daemon
 
 	info ""
