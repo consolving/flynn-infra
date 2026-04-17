@@ -194,6 +194,33 @@ setup_networking() {
 		sysctl -w net.bridge.bridge-nf-call-iptables=1 >/dev/null
 	fi
 
+	# Ubuntu Noble uses nftables by default. Flynn's pkg/iptables calls the
+	# iptables binary directly (iptables-legacy API). Ensure iptables-legacy
+	# is the default so Flynn's MASQUERADE and FORWARD rules work correctly.
+	if command -v update-alternatives &>/dev/null; then
+		if update-alternatives --query iptables 2>/dev/null | grep -q "nft"; then
+			info "Switching from iptables-nft to iptables-legacy..."
+			update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null || true
+			update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null || true
+		fi
+	fi
+
+	# Set FORWARD chain default policy to ACCEPT. Ubuntu Noble's default is
+	# DROP, which blocks container traffic even after Flynn adds its own
+	# FORWARD ACCEPT rules (they only match flannel bridge traffic, not the
+	# return path through other interfaces). This is required for containers
+	# to reach external networks (e.g., GitHub for buildpack downloads).
+	iptables -P FORWARD ACCEPT 2>/dev/null || true
+
+	# Persist the FORWARD policy across reboots
+	if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.d/99-flynn.conf 2>/dev/null; then
+		cat > /etc/sysctl.d/99-flynn.conf <<-SYSEOF
+		net.ipv4.ip_forward=1
+		net.ipv4.conf.all.forwarding=1
+		SYSEOF
+		sysctl --system >/dev/null 2>&1
+	fi
+
 	# Disable netplan and use systemd-networkd directly.
 	# Ubuntu Noble defaults to netplan, which can conflict with our static
 	# IP assignments. We bypass it entirely.

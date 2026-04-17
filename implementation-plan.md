@@ -420,6 +420,28 @@ All 4 resource limit integration tests now pass on the 5-node cgroups v2 cluster
 - **Needs sub-cluster**: Tests that spin up a sub-cluster inside Flynn (Discoverd, Volume, Backup tests)
 - **Needs overlay network**: Sirenia deploy tests connect directly to overlay IPs (100.100.x.x) unreachable from build server
 
+#### Container NAT Fix (2026-04-18)
+
+Containers on the flannel overlay network (100.100.x.0/24) could not reach external hosts (e.g., GitHub for buildpack downloads). The MASQUERADE and FORWARD rules in `pkg/iptables/iptables.go` were correct, but Ubuntu Noble's defaults blocked traffic.
+
+**Root causes** (all in `vagrant/provision.sh`):
+
+| Issue | Fix |
+|---|---|
+| Ubuntu Noble uses `iptables-nft` by default; Flynn calls the `iptables` binary directly using the legacy API | Switch to `iptables-legacy` via `update-alternatives` during provisioning |
+| FORWARD chain default policy is DROP (Ubuntu Noble default) | Set `iptables -P FORWARD ACCEPT` during provisioning |
+| IP forwarding sysctl not persisted | Write `net.ipv4.ip_forward=1` and `net.ipv4.conf.all.forwarding=1` to `/etc/sysctl.d/99-flynn.conf` |
+
+**Verification**: `flynn -a controller run -- ping -c1 8.8.8.8` succeeds; `wget https://github.com` succeeds from inside a container.
+
+#### TUF Metadata Refresh (2026-04-18)
+
+The TUF `timestamp.json` expired (2026-04-17T17:04:28Z), blocking `flynn-host download`. Re-signed snapshot (v34) and timestamp (v35) with 90-day expiry (2026-07-16) using a Python script with PyNaCl (ed25519 signing). The installed `tuf` CLI binary (from go-tuf) couldn't sign because it computes key IDs with a `scheme` field that the original key generation didn't include.
+
+**Key lesson**: The `tuf` binary's key ID computation includes a `scheme` field (`{"keytype":"ed25519","scheme":"ed25519","keyval":{"public":"..."}}`), but the keys were generated with an older go-tuf that omits `scheme` (`{"keytype":"ed25519","keyval":{"public":"..."}}`). The SHA256 of these different canonical JSON strings produces different key IDs, so the CLI says "no keys available". The Python re-signing script matches the original format.
+
+**TODO**: Set up automated timestamp refresh (CI cron job or similar) to prevent future expiry.
+
 ### Remaining Phase 6 Work
 
 - [x] Test 3-node cluster bootstrap with `--peer-ips` and `--min-hosts=3` — complete (2026-04-14), 37 processes across 3 nodes; mariadb/mongodb/router reported unhealthy at status-check but all processes running
@@ -434,7 +456,7 @@ All 4 resource limit integration tests now pass on the 5-node cgroups v2 cluster
 - [x] Run comprehensive integration tests — **33 tests passing** across 5 suites (2026-04-14)
 - [x] Fix resource limit tests for cgroups v2 — **40 tests passing** across 7 suites (2026-04-15)
 - [x] Fix `TestRunLimits` and all resource limit tests for cgroups v2 — **4/4 passing** (2026-04-15)
-- [ ] Configure NAT/masquerade for container internet access — to unblock buildpack tests that clone from GitHub
+- [x] Configure NAT/masquerade for container internet access (2026-04-18) — see "Container NAT Fix" below
 - [ ] Re-enable full integration test suite (`script/run-integration-tests`)
 - [ ] Validate database appliances (PostgreSQL, MariaDB, MongoDB, Redis) — start/stop, data persistence, failover
 - [ ] Restore pgextwlist and TimescaleDB support (see below)
@@ -458,6 +480,22 @@ All 4 resource limit integration tests now pass on the 5-node cgroups v2 cluster
 - [ ] Rebuild postgres squashfs layer and update TUF repo
 
 **Alternative** (simpler, less flexible): Keep `ExtWhitelist: false` permanently and expand `installExtensionsInTemplate()` to pre-install more extensions (hstore, citext, pg_trgm, etc.) in template1. This avoids the PPA dependency but limits users to a fixed set of extensions.
+
+## Phase 7: TUF Distribution — HTTP Frontend with IPFS Backend
+
+The TUF repository is currently hosted solely on GitHub Pages — a single point of failure. This phase adds decentralized, content-addressed storage via IPFS while keeping plain HTTP for clients (no code changes to the go-tuf client).
+
+See `specs/tuf-ipfs-mirror.md` for full architecture and design rationale.
+
+- [ ] Register domain/subdomain for TUF distribution (e.g., `tuf.consolving.net`)
+- [ ] Set up Pinata account with dedicated gateway and custom domain
+- [ ] Initial IPFS upload and pin of TUF repository (~9.2 GB)
+- [ ] Configure DNSLink TXT record and CNAME (TTL=60s)
+- [ ] Install kubo on build server as gateway-only fallback node
+- [ ] Add multi-origin failover to `flynn-host download` (IPFS gateway → GitHub Pages)
+- [ ] Add IPFS publish step to CI workflow (ipfs add → pin → update DNSLink)
+- [ ] Update `tup.config` and `builder/manifest.json` with new primary TUF URL
+- [ ] Test end-to-end: `flynn-host download` from IPFS-backed gateway
 
 ## Open Questions
 
