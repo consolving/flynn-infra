@@ -112,6 +112,7 @@ Go 1.13 was 6+ years old and unsupported. Upgraded to Go 1.22.12 in a single jum
 - [x] Audit the 3 `replace` directives in `go.mod` to understand what patches the Flynn forks carry
 - [x] Determine minimum viable Go version upgrade target (e.g., 1.21 for workspace support, or 1.22 for latest stdlib)
 - [x] Test compilation with the target Go version, fixing breakages iteratively
+- [x] Migrate base layer images from Ubuntu 18.04 Bionic to Ubuntu 24.04 Noble (see Phase 5.5 below)
 - [ ] Evaluate migrating from `vendor/` to Go module proxies (or keep vendored for reproducibility)
 - [ ] Update `libcontainer`/`runc` fork to a maintained version compatible with modern kernels
 
@@ -147,6 +148,54 @@ Additionally completed:
 
 - **vendor/ vs Go modules**: Currently keeping `vendor/` for reproducibility. Re-evaluate when CI is fully operational.
 - **runc fork modernization**: The Flynn runc fork (`v1.0.0-rc1001`) is 6+ years behind on security patches. Upgrading requires extracting the veth/loopback networking into Flynn's own code (using `vishvananda/netlink` directly), then migrating to modern runc. This is a significant undertaking tied to Phase 6 cluster bootstrap work.
+- **~~Base layer migration~~**: Complete — migrated to Ubuntu 24.04 Noble in Phase 5.5.
+
+## Phase 5.5: Base Image Migration — Ubuntu 18.04 → 24.04 (Complete)
+
+The container base layer images were migrated from Ubuntu 18.04 Bionic (EOL April 2023) to Ubuntu 24.04 LTS Noble Numbat (supported until 2034). This was done in the `noble-migration-and-fixes` branch and merged into master.
+
+- [x] Create `builder/img/ubuntu-noble.sh` — builds Noble rootfs from cloud image or debootstrap, creates squashfs layer
+- [x] Create `builder/img/heroku-24.sh` and `builder/img/heroku-24-build.sh` — Noble-based Heroku stack images
+- [x] Migrate all component base layers from Bionic to Noble
+- [x] Handle merged-usr (`/bin/` → `/usr/bin/` remapping) in `export-tuf` for Noble cloud images
+- [x] Migrate PostgreSQL from 11 to 16 (see "PostgreSQL 16 Migration" in Phase 6)
+- [x] Migrate MariaDB to 10.11 LTS (`innobackupex` → `mariabackup`)
+
+### PostgreSQL 16 Migration (Complete)
+
+**Files**: `appliance/postgresql/process.go`, `appliance/postgresql/cmd/flynn-postgres-api/main.go`, `controller/data/schema.go`, `controller/schema/schema.go`
+
+| Change | Detail |
+|---|---|
+| WAL config | `wal_keep_segments` → `wal_keep_size = 2048` (removed in PG13) |
+| WAL level | `wal_level = hot_standby` → `wal_level = replica` |
+| Password encryption | `password_encryption = md5` (PG16 defaults to scram-sha-256) |
+| Recovery mechanism | `recovery.conf` → `standby.signal` + config-based recovery |
+| Promotion | `promote_trigger_file` → `pg_ctl promote` (removed in PG16) |
+| Public schema | `GRANT ALL ON SCHEMA public TO PUBLIC` in template1 (PG15+ restriction) |
+| Database creation | `CREATE DATABASE ... OWNER` in postgres API |
+| Trigger functions | `RETURNS OPAQUE` → `RETURNS trigger` in 4 controller migrations (OPAQUE removed in PG16) |
+| Schema loader | Filter macOS `._*` resource fork files from JSON schema directory |
+
+**pgextwlist/TimescaleDB**: Config preserved in `process.go` (`shared_preload_libraries = 'timescaledb'`, `local_preload_libraries = 'pgextwlist'`, full extension whitelist). Packages not yet installed in the Noble base layer — see "pgextwlist / TimescaleDB Restoration" below.
+
+### MariaDB 10.11 LTS Migration (Complete)
+
+**File**: `appliance/mariadb/cmd/flynn-mariadb/main.go`
+
+Migrated from `innobackupex` (deprecated, removed in MariaDB 10.3+) to `mariabackup` for MariaDB 10.11 LTS (the version available in Ubuntu Noble repos).
+
+### Additional Source Code Changes (Post-Noble Merge)
+
+| Commit | File | Change |
+|---|---|---|
+| `c540b45e` | `appliance/postgresql/` | PostgreSQL 16 compatibility (see above) |
+| `2ec11480` | `controller/data/schema.go`, `controller/schema/schema.go` | PG16 trigger functions + macOS resource fork filtering |
+| `aec88051` | `flannel/backend/vxlan/device.go` | Re-apply deterministic MAC after `LinkSetUp()` which resets hardware address |
+| `4b4de5f4` | `host/libcontainer_backend.go` | Call TUF `Update()` after initialization; root key fallback for fresh stores |
+| `06bf70c7` | `pkg/postgres/migrate.go` | Propagate `CREATE TABLE schema_migrations` errors (was nil pointer panic) |
+| `fbf29299` | `script/export-tuf/main.go` | `ExtraDirs`, `PackageScript`, `--skip-base-layers`, Noble merged-usr support, GitHub Releases URLs |
+| `44b47d70` | `host/downloader/downloader.go` | Direct squashfs layer download with `sha512_256` verification; GitHub Releases as layer source |
 
 ## Phase 6: Integration Testing and Cluster Bootstrap
 
@@ -163,7 +212,7 @@ Flynn's setup process and cluster bootstrap need to be tested in real VMs, not j
 
 **Why not the original Vagrantfiles**: The existing `flynn/Vagrantfile` and `flynn/demo/Vagrantfile` both depend on the offline `dl.flynn.io` for the `flynn-base` box and use VirtualBox as the provider. Neither works as-is.
 
-**Approach**: Custom Debian 13 (Trixie) Vagrant boxes built from official cloud images, using Vagrant with the libvirt provider and KVM hardware acceleration on both machines.
+**Approach**: Initially used custom Debian 13 (Trixie) Vagrant boxes, then switched to Ubuntu Noble 24.04 to align with the component base layer OS. Vagrant boxes use the libvirt provider with KVM hardware acceleration on both machines.
 
 #### Vagrant Box Infrastructure (Complete)
 
@@ -208,7 +257,7 @@ Custom Vagrant boxes were built from official Debian 13 `generic` cloud images (
 #### Flynn Cluster Vagrantfile (Complete)
 
 **Design**:
-- Debian 13 base (custom boxes above) instead of Ubuntu 18.04 — aligns with dev-machine OS, modern kernel, better hardware support
+- Ubuntu Noble 24.04 base (initially Debian 13, switched to Noble to align with component base layers) instead of Ubuntu 18.04 — modern kernel, better hardware support
 - libvirt provider with KVM acceleration (instead of VirtualBox)
 - Private network bridge for inter-node communication (full TCP/UDP connectivity required by discoverd, flannel, flynn-host API)
 - Configurable node count: 1 node (singleton) or 3+ nodes (multi-node; Flynn rejects `--min-hosts=2`)
@@ -221,7 +270,7 @@ Custom Vagrant boxes were built from official Debian 13 `generic` cloud images (
 
 | Requirement | Detail |
 |---|---|
-| OS | Debian 13 amd64 (or arm64 on ARM64 machine) |
+| OS | Ubuntu 24.04 Noble amd64 (or arm64 on ARM64 machine) |
 | RAM / CPU / Disk | 4 GB / 2 cores / 40 GB minimum (singleton); 8 GB / 4 cores / 40 GB (multi-node HA) |
 | Kernel features | OverlayFS, cgroups v2 (unified hierarchy), ZFS module |
 | System packages | `zfsutils-linux`, `zfs-dkms`, `linux-headers-*`, `iptables`, `curl`, `squashfs-tools` |
@@ -273,9 +322,9 @@ Single-node Flynn cluster bootstrap completed successfully on 2026-04-13. All 40
 - [ ] Re-enable integration tests (`script/run-integration-tests`) against the bootstrapped cluster
 - [ ] Validate database appliances (PostgreSQL, MariaDB, MongoDB, Redis)
 
-#### Code Changes for Debian 13 / Cgroups v2 (branch: `debian13-cgroups-v2-bootstrap`)
+#### Code Changes for Debian 13 / Ubuntu Noble / Cgroups v2 (branch: `debian13-cgroups-v2-bootstrap`, `noble-migration-and-fixes`, `pg16-and-bootstrap-fixes`)
 
-The following patches were required to make Flynn run on Debian 13 (kernel 6.12, cgroups v2 only, glibc 2.40):
+The following patches were required to make Flynn run on Debian 13 / Ubuntu Noble (kernel 6.x, cgroups v2 only):
 
 | File | Change | Why |
 |---|---|---|
@@ -284,11 +333,11 @@ The following patches were required to make Flynn run on Debian 13 (kernel 6.12,
 | `vendor/.../apply_raw.go` | Guard `CheckCpushares()` with `!IsCgroup2UnifiedMode()` | `cpu.shares` file doesn't exist on v2; unconditional read causes failure |
 | `host/volume/zfs/zfs.go` | Fallback from `copySparse` (FIEMAP) to sequential `io.Copy` | tmpfs on Debian 13 returns EOPNOTSUPP for FIEMAP ioctl |
 | `vendor/.../dns/clientconfig.go` | Fix `len(s) >= 8` guard to `len(s) >= 9` before `s[:9]` | Debian 13 resolv.conf has `trust-ad` (8 chars), triggering panic |
-| `appliance/postgresql/cmd/flynn-postgres/main.go` | `TimescaleDB: false`, `ExtWhitelist: false` | See "pgextwlist / TimescaleDB restoration" below |
+| `appliance/postgresql/cmd/flynn-postgres/main.go` | `TimescaleDB: false`, `ExtWhitelist: false` | See "pgextwlist / TimescaleDB restoration" below; PG16 config preserved but packages not installed |
 | `appliance/postgresql/process.go` | `installExtensionsInTemplate()` — pre-installs `uuid-ossp` and `pgcrypto` in template1 | Non-superuser app DB users can't run CREATE EXTENSION without pgextwlist |
 | `router/server.go` | Use `EXTERNAL_IP` for discoverd registration, `LISTEN_IP` for bind only | Router registered `0.0.0.0:5000` with discoverd, unreachable from other nodes |
 
-**Build requirements**: All binaries destined for container images must be built with `CGO_ENABLED=0` (static linking). The container base is Ubuntu 18.04 Bionic (glibc 2.27); the dev machine has glibc 2.40+. Dynamically-linked binaries fail with `GLIBC_2.34 not found`.
+**Build requirements**: All binaries destined for container images must be built with `CGO_ENABLED=0` (static linking). The container base is Ubuntu 24.04 Noble (glibc 2.39); dynamically-linked binaries built on newer systems may fail with glibc version mismatches.
 
 #### Volume Manager Layer Caching
 
@@ -313,15 +362,18 @@ The `mountSquashfs` function in `libcontainer_backend.go` uses a two-tier cachin
 
 #### TUF Image Rebuilds
 
+Initially built with Ubuntu 18.04 Bionic base layers, then rebuilt with Ubuntu 24.04 Noble base layers after the Noble migration (Phase 5.5).
+
 | Image | Layers | Change |
 |---|---|---|
-| postgres | 3: base (`33121091`) + packages (`d0f9b319`, 71MB) + binaries (`f4232c7c`, 11MB) | Added PostgreSQL 11 packages layer; rebuilt binaries with `CGO_ENABLED=0` and extension fixes; added `SET default_transaction_read_only = off` for multi-node |
-| controller | 2: base (`03fe7735`) + binaries+schemas (`e8a66adf`, 20MB) | Rebuilt with `CGO_ENABLED=0`; added `/etc/flynn-controller/jsonschema/` (was missing, caused nil pointer crash) |
-| flannel | 2: base (`03fe7735`) + binaries (`9d2da31c`, 11MB) | Rebuilt `flanneld` with `CGO_ENABLED=0` and unique VXLAN MAC fix |
-| router | 2: base (`03fe7735`) + binaries (`60cd196b`, 5.6MB) | Rebuilt `flynn-router` with `CGO_ENABLED=0` and `EXTERNAL_IP` registration fix |
-| gitreceive | 3: base (`03fe7735`) + git packages (`d59b6f41`, 28MB) + binaries | Added git packages layer (`apt-get install git`); container was missing `git` binary causing HTTP 500 on push |
-| slugbuilder-18 | 3: base (`03fe7735`) + packages (`80a1e4bf`, 50MB) + binaries | Added combined packages layer with git, ruby, daemontools, pigz, and 5 Heroku buildpacks (Go, multi, Ruby, Node.js, Python) |
-| slugrunner-18 | 3: base (`03fe7735`) + packages (`80a1e4bf`, 50MB) + binaries | Reused slugbuilder packages layer (ruby needed for Procfile parsing via `ruby -r yaml`) |
+| postgres | 3: Noble base + PostgreSQL 16 packages + binaries | PG16 compatibility; `CGO_ENABLED=0`; extension fixes; `SET default_transaction_read_only = off` for multi-node |
+| controller | 2: Noble base + binaries+schemas | `CGO_ENABLED=0`; PG16 trigger functions; JSON schemas in `/etc/flynn-controller/jsonschema/` |
+| flannel | 2: Noble base + binaries | `CGO_ENABLED=0`; unique VXLAN MAC fix; MAC reset after LinkSetUp fix |
+| router | 2: Noble base + binaries | `CGO_ENABLED=0`; `EXTERNAL_IP` registration fix |
+| gitreceive | 3: Noble base + git packages + binaries | Git packages layer (`apt-get install git`) |
+| slugbuilder | 3: Noble base + packages + binaries | Combined packages layer with git, ruby, daemontools, pigz, and Heroku buildpacks (heroku-24 stack) |
+| slugrunner | 3: Noble base + packages + binaries | Reused slugbuilder packages layer (ruby needed for Procfile parsing) |
+| mariadb | Noble base + binaries | `mariabackup` migration for MariaDB 10.11 LTS |
 
 ### Git Push Pipeline Fix (2026-04-14)
 
@@ -366,7 +418,7 @@ All 4 resource limit integration tests now pass on the 5-node cgroups v2 cluster
 
 3. **`setupGitreceive()` blocks non-git tests**: The test binary's `main()` unconditionally called `setupGitreceive()` which runs `flynn -a gitreceive env set` — triggering a deployment that hangs when the router has no routes. **Fix**: Only call `setupGitreceive()` when the `-run` filter matches git-related test names.
 
-**5-node cluster configuration**: 5 VMs (Vagrant + libvirt), each 4 CPUs / 8 GB RAM, Debian 13, ZFS on `/dev/vdb`, `fs.inotify.max_user_instances=1024`. Bootstrap with `--min-hosts=5`. Static `flynn-init` deployed to all nodes (CGO_ENABLED=0 for glibc compatibility).
+**5-node cluster configuration**: 5 VMs (Vagrant + libvirt), each 4 CPUs / 8 GB RAM, Ubuntu Noble 24.04, ZFS on `/dev/vdb`, `fs.inotify.max_user_instances=1024`. Bootstrap with `--min-hosts=5`. Static `flynn-init` deployed to all nodes (CGO_ENABLED=0 for glibc compatibility).
 
 #### Integration Test Progress (2026-04-14)
 
@@ -456,25 +508,34 @@ The TUF `timestamp.json` expired (2026-04-17T17:04:28Z), blocking `flynn-host do
 - [x] Run comprehensive integration tests — **33 tests passing** across 5 suites (2026-04-14)
 - [x] Fix resource limit tests for cgroups v2 — **40 tests passing** across 7 suites (2026-04-15)
 - [x] Fix `TestRunLimits` and all resource limit tests for cgroups v2 — **4/4 passing** (2026-04-15)
-- [x] Configure NAT/masquerade for container internet access (2026-04-18) — see "Container NAT Fix" below
+- [x] Migrate base layer images from Ubuntu 18.04 Bionic to Ubuntu 24.04 Noble (2026-04-16)
+- [x] Migrate PostgreSQL from 11 to 16 — WAL config, recovery mechanism, promotion, schema grants (2026-04-16)
+- [x] Migrate MariaDB to 10.11 LTS — `innobackupex` → `mariabackup` (2026-04-16)
+- [x] Fix controller PG16 trigger functions (`RETURNS OPAQUE` → `RETURNS trigger`) (2026-04-16)
+- [x] Fix migration framework `CREATE TABLE` error propagation (2026-04-16)
+- [x] Enhance `export-tuf` with `ExtraDirs`, package layers, Noble merged-usr support (2026-04-16)
+- [x] Add direct squashfs layer download with sha512_256 verification (2026-04-17)
+- [x] Fix flannel VXLAN MAC reset after `LinkSetUp()` (2026-04-16)
+- [x] Configure NAT/masquerade for container internet access (2026-04-18) — see "Container NAT Fix" above
 - [ ] Re-enable full integration test suite (`script/run-integration-tests`)
 - [ ] Validate database appliances (PostgreSQL, MariaDB, MongoDB, Redis) — start/stop, data persistence, failover
-- [ ] Restore pgextwlist and TimescaleDB support (see below)
-- [ ] Build missing packages layers for remaining images (redis, mariadb, mongodb, taffy)
+- [ ] Restore pgextwlist and TimescaleDB support (see above)
+- [ ] Build missing packages layers for remaining images (redis, mongodb, taffy)
 - [ ] Publish patched `flynn-host` binary via TUF (currently deployed manually)
-- [ ] Full TUF repo rebuild with all fixed binaries and packages layers
+- [ ] Full TUF repo rebuild with all Noble-based images and fixed binaries
+- [ ] Set up automated TUF timestamp refresh (CI cron job) to prevent metadata expiry
 
 #### pgextwlist / TimescaleDB Restoration
 
-**Current state**: `TimescaleDB: false` and `ExtWhitelist: false` in `appliance/postgresql/cmd/flynn-postgres/main.go`. The `installExtensionsInTemplate()` workaround pre-installs `uuid-ossp` and `pgcrypto` in `template1`, which covers all of Flynn's internal needs (controller migrations, blobstore).
+**Current state**: pgextwlist and TimescaleDB config is preserved in `process.go` (`shared_preload_libraries`, `local_preload_libraries`, extension whitelist), but the actual PG16-compatible packages are not installed in the Noble base layer. The `installExtensionsInTemplate()` workaround pre-installs `uuid-ossp` and `pgcrypto` in `template1`, covering Flynn's internal needs (controller migrations, blobstore).
 
 **What this disables**: End-user applications can no longer self-serve `CREATE EXTENSION` for the ~30 extensions that were previously whitelisted by pgextwlist (hstore, citext, postgis, pg_trgm, plv8, etc.). Any app that relies on these will get a permission error. TimescaleDB is also unavailable, though no Flynn component uses it.
 
-**Why it was necessary**: The postgres packages layer was built manually from Ubuntu 18.04 Bionic repos without adding the third-party PPAs that provide `postgresql-11-pgextwlist` (pgextwlist PPA) and `timescaledb-postgresql-11` (TimescaleDB PPA). PostgreSQL crashes fatally if `shared_preload_libraries` or `local_preload_libraries` references a missing `.so` file.
+**Why it was necessary**: The postgres packages layer does not include the third-party PPAs that provide `postgresql-16-pgextwlist` (pgextwlist PPA) and `timescaledb-2-postgresql-16` (TimescaleDB PPA). PostgreSQL crashes fatally if `shared_preload_libraries` or `local_preload_libraries` references a missing `.so` file.
 
 **To restore full functionality**:
-- [ ] Add TimescaleDB and pgextwlist PPAs to the postgres packages layer build
-- [ ] Install `postgresql-11-pgextwlist` and optionally `timescaledb-postgresql-11`
+- [ ] Add TimescaleDB and pgextwlist PPAs to the postgres packages layer build (Ubuntu Noble)
+- [ ] Install `postgresql-16-pgextwlist` and optionally `timescaledb-2-postgresql-16`
 - [ ] Re-enable `ExtWhitelist: true` (and optionally `TimescaleDB: true`) in `main.go`
 - [ ] Remove the `installExtensionsInTemplate()` workaround from `process.go` (pgextwlist handles permissions natively)
 - [ ] Rebuild postgres squashfs layer and update TUF repo
@@ -501,6 +562,6 @@ See `specs/tuf-ipfs-mirror.md` for full architecture and design rationale.
 
 - ~~Should the Go version be upgraded incrementally (1.13 -> 1.16 -> 1.19 -> 1.22) or in a single jump?~~ **Resolved**: Single jump to Go 1.22 succeeded.
 - ~~Is ARM64/aarch64 support a priority, or focus on x86_64 first?~~ **Resolved (2026-04-13)**: Both supported in parallel. x86_64 is primary (Proxmox build server), ARM64 available via native NVIDIA GB10 machine. Cross-arch emulation via QEMU TCG is not practical — requires native hardware. RISC-V deferred (no native hardware). See `specs/dev-machine.md`.
-- ~~What is the target Linux distribution for the base layer images (Ubuntu Trusty/Xenial are EOL)?~~ **Resolved**: Debian 13 (Trixie) chosen for Vagrant test VMs. Base layer images for Flynn components still use Ubuntu Bionic (built via debootstrap in Phase 3) — migrating these is future work.
+- ~~What is the target Linux distribution for the base layer images (Ubuntu Trusty/Xenial are EOL)?~~ **Resolved (2026-04-16)**: Ubuntu 24.04 LTS Noble Numbat. Vagrant test VMs also run Noble. Base layer images built via cloud image download or debootstrap (`builder/img/ubuntu-noble.sh`). Heroku stack migrated from heroku-18 to heroku-24.
 - ~~When should the runc fork be modernized?~~ **Partially resolved (2026-04-13)**: The vendored runc fork already has cgroups v2 controller code (`cpu_v2.go`, `memory_v2.go`, etc.) which works on Debian 13. The remaining concern is security patches (6+ years of unpatched CVEs), but the fork is functionally adequate for cluster bootstrap. Modernization is desirable but no longer blocking.
 - Should the self-hosting build be preserved long-term, or replaced entirely with container-based CI?

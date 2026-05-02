@@ -336,6 +336,15 @@ install_flynn() {
 	info "Setting release channel to 'stable'..."
 	echo "stable" >/etc/flynn/channel.txt
 
+	# If using a local binary, pre-install it to bin-dir before download.
+	# This prevents flynn-host download from re-executing a stale TUF-published
+	# version that may lack bug fixes (e.g. squashfs layer download support).
+	if [[ -n "$LOCAL_BINARY" ]] && [[ -f "$LOCAL_BINARY" ]]; then
+		info "Pre-installing local flynn-host to /usr/local/bin..."
+		cp "$LOCAL_BINARY" /usr/local/bin/flynn-host
+		chmod +x /usr/local/bin/flynn-host
+	fi
+
 	info "Downloading Flynn components via flynn-host download..."
 	"$bootstrap_binary" download \
 		--repository "${REPO_URL}" \
@@ -343,9 +352,9 @@ install_flynn() {
 		--config-dir "/etc/flynn" \
 		--bin-dir "/usr/local/bin"
 
-	# If using a local binary, replace the TUF-downloaded flynn-host with our patched version
+	# Ensure local binary takes precedence over TUF-downloaded version
 	if [[ -n "$LOCAL_BINARY" ]] && [[ -f "$LOCAL_BINARY" ]]; then
-		info "Replacing installed flynn-host with patched version..."
+		info "Ensuring local flynn-host is installed..."
 		cp "$LOCAL_BINARY" /usr/local/bin/flynn-host
 		chmod +x /usr/local/bin/flynn-host
 	fi

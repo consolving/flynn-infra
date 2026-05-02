@@ -1,34 +1,27 @@
 {
   "type": "flynn",
-  "uri": "https://consolving.github.io/flynn-tuf-repo/repository?name=test-apps",
+  "uri": "http://blobstore.discoverd/test-apps-v5",
   "manifest": {
     "_type": "application/vnd.flynn.image.manifest.v1+json",
     "rootfs": [
       {
-        "platform": {
-          "os": "linux",
-          "architecture": "amd64"
-        },
+        "platform": {"os": "linux", "architecture": "amd64"},
         "layers": [
           {
-            "id": "03fe773594b3cc0e6c7a56631f918bbe99701d7d6d4b62c1b0d47b554b68db5e",
+            "id": "c5b2dc174e5d0b81f133ab574c0ff9fc7db31fd951d1f44ade667ff3efbf7f56",
             "type": "application/vnd.flynn.image.squashfs.v1",
-            "hashes": {
-              "sha512_256": "03fe773594b3cc0e6c7a56631f918bbe99701d7d6d4b62c1b0d47b554b68db5e"
-            },
-            "length": 2408448
+            "hashes": {"sha512_256": "c5b2dc174e5d0b81f133ab574c0ff9fc7db31fd951d1f44ade667ff3efbf7f56"},
+            "length": 30121984
           }
         ]
       }
     ]
   },
-  "hashes": {
-    "sha512_256": "4df224f8170e1d552da714008bc3ac593885a3b77e5664be22eb03e70dd30f2f"
-  },
+  "hashes": {"sha512_256": "c5b2dc174e5d0b81f133ab574c0ff9fc7db31fd951d1f44ade667ff3efbf7f56"},
   "size": 360,
-  "layer_url_template": "https://consolving.github.io/flynn-tuf-repo/repository?target=/layers/{id}.squashfs",
+  "layer_url_template": "http://100.100.57.10:80/{id}",
   "meta": {
-    "manifest.id": "4df224f8170e1d552da714008bc3ac593885a3b77e5664be22eb03e70dd30f2f",
+    "manifest.id": "c5b2dc174e5d0b81f133ab574c0ff9fc7db31fd951d1f44ade667ff3efbf7f56",
     "flynn.component": "test-apps",
     "flynn.system-image": "true"
   }
