@@ -320,7 +320,7 @@ Single-node Flynn cluster bootstrap completed successfully on 2026-04-13. All 40
 - [x] Get `flannel` networking operational
 - [x] Bootstrap a minimal Flynn cluster (discoverd + flannel + controller + host)
 - [ ] Re-enable integration tests (`script/run-integration-tests`) against the bootstrapped cluster
-- [x] Validate database appliances (PostgreSQL, MariaDB, MongoDB, Redis) — (2026-05-04) PG16 pass, MariaDB pass (with fixes), MongoDB blocked (mgo driver), Redis pass
+- [x] Validate database appliances (PostgreSQL, MariaDB, MongoDB, Redis) — (2026-05-04) PG16 pass, MariaDB pass (with fixes), MongoDB pass (with driver migration), Redis pass
 
 #### Code Changes for Debian 13 / Ubuntu Noble / Cgroups v2 (branch: `debian13-cgroups-v2-bootstrap`, `noble-migration-and-fixes`, `pg16-and-bootstrap-fixes`)
 
@@ -521,7 +521,7 @@ The TUF `timestamp.json` expired (2026-04-17T17:04:28Z), blocking `flynn-host do
 - [x] Validate database appliances (PostgreSQL, MariaDB, MongoDB, Redis) — start/stop, data persistence, failover (2026-05-04) — see "Database Appliance Validation" below
 - [ ] Restore pgextwlist and TimescaleDB support (see above)
 - [ ] Build missing packages layers for remaining images (redis, mongodb, taffy, gitreceive — `git` not in base layer)
-- [ ] Migrate MongoDB driver from `gopkg.in/mgo.v2` to `go.mongodb.org/mongo-driver` (required for MongoDB 5.1+ compatibility)
+- [ ] Migrate MongoDB driver from `gopkg.in/mgo.v2` to `go.mongodb.org/mongo-driver` (required for MongoDB 5.1+ compatibility) — **DONE** (2026-05-04, commits `44a63915`, `6cfa3202`). See "Database Appliance Validation" below.
 - [ ] Publish patched `flynn-host` binary via TUF (currently deployed manually)
 - [ ] Full TUF repo rebuild with all Noble-based images and fixed binaries
 - [x] Set up automated TUF timestamp refresh (CI cron job) to prevent metadata expiry (2026-05-03)
@@ -590,12 +590,14 @@ Tested all four database appliances on a single-node Vagrant cluster (Ubuntu Nob
 - **Fix 6** (`process.go`): `db.SetMaxOpenConns(1)` to force single connection reuse after `FLUSH PRIVILEGES` re-enables auth (new connections would fail since root uses `unix_socket`).
 - After fixes: provisioning, CREATE TABLE, INSERT, SELECT, process kill + restart, data persistence all verified.
 
-**MongoDB 6.0/7.0/8.0 — BLOCKED**
-- **Missing `mongod` binary**: The base image build didn't include the `mongodb-org-server` package (APT repo config was added but install failed). Fixed by extracting `mongod` from the deb package and adding it to the base squashfs layer.
-- **Missing `mongodb` system user**: Similar to MariaDB — the `start.sh` does `chown mongodb:mongodb` and `sudo -u mongodb`, but the user doesn't exist in the container. Fixed by adding `useradd` to `start.sh`.
-- **OP_QUERY wire protocol removed**: The Flynn MongoDB appliance uses `gopkg.in/mgo.v2` (2016-era driver) which communicates exclusively via `OP_QUERY`. MongoDB 5.1+ deprecated `OP_QUERY` for non-`isMaster` commands, and 6.0+ rejects it entirely. The health check (`mgo.DialWithInfo` which sends `OP_QUERY` ping) fails with "Unsupported OP_QUERY command: ping". This affects ALL operations, not just the health check — the entire `mgo` driver is incompatible with MongoDB 5.1+.
-- **To fix**: Replace `gopkg.in/mgo.v2` with the official `go.mongodb.org/mongo-driver` (`go.mongodb.org/mongo-driver/v2`). This is a significant refactor affecting `appliance/mongodb/process.go`, `replset.go`, `handler.go`, and the test files. The `mgo` Session API is fundamentally different from the official driver's Collection/Client API.
-- **Alternative**: Use MongoDB 5.0 (last version with full OP_QUERY support), but 5.0 reached EOL in October 2024 and has no Ubuntu Noble packages.
+**MongoDB 6.0/7.0/8.0 — PASS (with driver migration)**
+- **Driver migration**: Replaced `gopkg.in/mgo.v2` with `go.mongodb.org/mongo-driver v1.17.9` (commit `44a63915`). The mgo driver uses OP_QUERY wire protocol which MongoDB 5.1+ deprecated and 6.0+ rejects entirely.
+- **Files changed**: `appliance/mongodb/process.go`, `appliance/mongodb/process_test.go`, `appliance/mongodb/replset.go`, `appliance/mongodb/cmd/flynn-mongodb-api/main.go`, `test/test_mongodb.go`, `go.mod`/`go.sum`, vendor directory.
+- **Key mappings**: `mgo.Session` → `mongo.Client`, `DialInfo()` → `ClientOptions()`, `session.Run()` → `RunCommand()`, `mgo.QueryError` → `mongo.CommandError`, `bson.D` uses keyed fields.
+- **BSON timestamp fix** (commit `6cfa3202`): `replSetOptime.Timestamp` changed from `int64` to `primitive.Timestamp` — the official driver is strict about BSON Timestamp types (mgo auto-converted).
+- **Missing `mongod` binary**: Base image build didn't include `mongodb-org-server` package. Fixed by extracting from deb and adding to base squashfs layer.
+- **Missing `mongodb` system user**: Fixed by adding `useradd`/`groupadd` to `start.sh` (commit `52db40b5`).
+- After fixes: provisioning (database + user creation via API), CRUD (insert, read, update, delete), SCRAM-SHA-256 authentication, replica set configuration — all verified on MongoDB 8.0.
 
 **Redis 7.0 — PASS**
 - Redis is a single-process appliance (not sirenia-based). Each provisioned instance gets its own Flynn app.
@@ -618,6 +620,18 @@ See `specs/tuf-ipfs-mirror.md` for full architecture and design rationale.
 - [ ] Add IPFS publish step to CI workflow (ipfs add → pin → update DNSLink)
 - [ ] Update `tup.config` and `builder/manifest.json` with new primary TUF URL
 - [ ] Test end-to-end: `flynn-host download` from IPFS-backed gateway
+
+## Post-Quantum Cryptography Assessment (2026-05-04)
+
+Ubuntu 26.04 LTS will ship with OpenSSL 3.x supporting post-quantum algorithms (ML-KEM/Kyber for key exchange, ML-DSA/Dilithium for signatures). **Flynn would not meaningfully benefit from PQC at this time:**
+
+- **Go 1.22 has no PQC support.** Go added experimental ML-KEM in 1.24; Flynn would need a Go upgrade first.
+- **go-tuf doesn't support PQC signatures.** The TUF spec and go-tuf library only support ed25519/RSA/ECDSA. Adding ML-DSA would require upstream library changes.
+- **Flynn's Go binaries use Go's own crypto, not OpenSSL.** Only SSH and `curl` inside containers would use the system OpenSSL. The TUF signing, TLS termination, and database auth all use Go stdlib crypto.
+- **TUF signatures are short-lived** (90-day expiry, monthly refresh). The "harvest now, forge later" threat doesn't apply to ephemeral metadata.
+- **Flynn runs on private infrastructure.** TLS traffic stays on a private overlay network (flannel VXLAN). There's no public-facing PKI requiring decades of signature validity.
+
+**Future upgrade path** (not yet actionable): Go 1.24+ → go-tuf with ML-DSA support → TUF root key rotation to hybrid ed25519+ML-DSA → Ubuntu 26.04 base layer for container-side PQC. Re-evaluate when Go and go-tuf add stable PQC support.
 
 ## Open Questions
 
