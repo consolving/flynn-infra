@@ -320,7 +320,7 @@ Single-node Flynn cluster bootstrap completed successfully on 2026-04-13. All 40
 - [x] Get `flannel` networking operational
 - [x] Bootstrap a minimal Flynn cluster (discoverd + flannel + controller + host)
 - [ ] Re-enable integration tests (`script/run-integration-tests`) against the bootstrapped cluster
-- [ ] Validate database appliances (PostgreSQL, MariaDB, MongoDB, Redis)
+- [x] Validate database appliances (PostgreSQL, MariaDB, MongoDB, Redis) — (2026-05-04) PG16 pass, MariaDB pass (with fixes), MongoDB blocked (mgo driver), Redis pass
 
 #### Code Changes for Debian 13 / Ubuntu Noble / Cgroups v2 (branch: `debian13-cgroups-v2-bootstrap`, `noble-migration-and-fixes`, `pg16-and-bootstrap-fixes`)
 
@@ -492,7 +492,7 @@ The TUF `timestamp.json` expired (2026-04-17T17:04:28Z), blocking `flynn-host do
 
 **Key lesson**: The `tuf` binary's key ID computation includes a `scheme` field (`{"keytype":"ed25519","scheme":"ed25519","keyval":{"public":"..."}}`), but the keys were generated with an older go-tuf that omits `scheme` (`{"keytype":"ed25519","keyval":{"public":"..."}}`). The SHA256 of these different canonical JSON strings produces different key IDs, so the CLI says "no keys available". The Python re-signing script matches the original format.
 
-**TODO**: Set up automated timestamp refresh (CI cron job or similar) to prevent future expiry.
+**TODO**: ~~Set up automated timestamp refresh (CI cron job or similar) to prevent future expiry.~~ Done (2026-05-03). Monthly cron in `flynn-tuf-repo/.github/workflows/refresh-tuf.yml` re-signs snapshot and timestamp with 90-day expiry using PyNaCl + ed25519 keys from GitHub secrets.
 
 ### Remaining Phase 6 Work
 
@@ -517,13 +517,40 @@ The TUF `timestamp.json` expired (2026-04-17T17:04:28Z), blocking `flynn-host do
 - [x] Add direct squashfs layer download with sha512_256 verification (2026-04-17)
 - [x] Fix flannel VXLAN MAC reset after `LinkSetUp()` (2026-04-16)
 - [x] Configure NAT/masquerade for container internet access (2026-04-18) — see "Container NAT Fix" above
-- [ ] Re-enable full integration test suite (`script/run-integration-tests`)
-- [ ] Validate database appliances (PostgreSQL, MariaDB, MongoDB, Redis) — start/stop, data persistence, failover
+- [x] Re-enable integration test suite on single-node Vagrant cluster (2026-05-03) — see "Single-Node Vagrant Integration Tests" below
+- [x] Validate database appliances (PostgreSQL, MariaDB, MongoDB, Redis) — start/stop, data persistence, failover (2026-05-04) — see "Database Appliance Validation" below
 - [ ] Restore pgextwlist and TimescaleDB support (see above)
-- [ ] Build missing packages layers for remaining images (redis, mongodb, taffy)
+- [ ] Build missing packages layers for remaining images (redis, mongodb, taffy, gitreceive — `git` not in base layer)
+- [ ] Migrate MongoDB driver from `gopkg.in/mgo.v2` to `go.mongodb.org/mongo-driver` (required for MongoDB 5.1+ compatibility)
 - [ ] Publish patched `flynn-host` binary via TUF (currently deployed manually)
 - [ ] Full TUF repo rebuild with all Noble-based images and fixed binaries
-- [ ] Set up automated TUF timestamp refresh (CI cron job) to prevent metadata expiry
+- [x] Set up automated TUF timestamp refresh (CI cron job) to prevent metadata expiry (2026-05-03)
+
+#### Single-Node Vagrant Integration Tests (2026-05-03)
+
+**Infrastructure**: Single Vagrant VM (node1, 192.168.50.11, 4GB RAM, 4 CPUs, ZFS on /dev/vdb, Ubuntu Noble). `flynn-host` built with `-ldflags "-X .../version.version=v20260416.0"` to prevent re-execution of TUF-published binary (which lacks direct squashfs download support). Cluster domain: `demo.localflynn.com`. Test runner: `script/run-integration-tests-vagrant`.
+
+**Key findings from test run**:
+
+1. **TUF download works end-to-end**: `flynn-host download` successfully fetches all 22 images from GitHub Releases via the new TUF repo. Version matching (`-ldflags` version = TUF version) prevents binary re-execution.
+
+2. **Bootstrap succeeds in ~10 seconds**: All services healthy on single node.
+
+3. **Tests passing**: `CLISuite.TestCreateAppNoGit`, `CLISuite.TestCluster`, `CLISuite.TestDeployTimeout`, `CLISuite.TestAppWithNoRemote`, `PostgresSuite.TestSSLRenegotiationLimit`, `PostgresSuite.TestDumpRestore`, `RedisSuite.TestRedisEnv`, `HostSuite.TestAttachNonExistentJob`, `HealthcheckSuite.TestKillDown`, `DeployerSuite.TestInBatchesStrategy`.
+
+4. **test-apps artifact**: Built locally with `mksquashfs` (ubuntu base layer + test app binaries at `/bin/echoer`, `/bin/pingserv`, etc.). Layer served via local HTTP on the VM (`python3 -m http.server 8888`). The layer URL template in `test-apps.json` points to `http://192.168.50.11:8888/{id}.squashfs`.
+
+**Failure categories**:
+
+| Category | Tests affected | Root cause |
+|---|---|---|
+| Missing `git` in containers | All git push tests (GitDeploySuite, ControllerSuite.TestAppDeleteCleanup) | `git` binary not in base layer or gitreceive layer; needs packages layer rebuild |
+| Multi-node tests | SchedulerSuite.TestGracefulShutdown, DeployerSuite.TestOmniProcess, GitreceiveSuite, BlobstoreSuite.TestBlobstoreBackendMinio | `bootCluster()` expects discoverd at `127.0.0.1:1111` or needs `host_id` tags on multiple hosts |
+| Sirenia deploy timeouts | PostgresSuite.TestDeployMultipleAsync, MariaDBSuite.TestDeployMultipleAsync | Single-node can't run 5-node sirenia deploy; waits for replication sync that never completes |
+| HealthcheckSuite.TestStatus | Expects 14 services, gets 13 | `mariadb` and `mongodb` show as unhealthy; count matches but health status mismatch |
+| TarreceiveSuite.TestDeleteLayers | Output format mismatch | Expects "404 Not Found" in curl output, gets "404" only |
+
+**Key decision**: The `flynn-host` binary re-execution problem (version mismatch → downloads TUF binary → re-executes with old code) is solved by building with matching version ldflags. This should be automated in the CI workflow.
 
 #### pgextwlist / TimescaleDB Restoration
 
@@ -541,6 +568,40 @@ The TUF `timestamp.json` expired (2026-04-17T17:04:28Z), blocking `flynn-host do
 - [ ] Rebuild postgres squashfs layer and update TUF repo
 
 **Alternative** (simpler, less flexible): Keep `ExtWhitelist: false` permanently and expand `installExtensionsInTemplate()` to pre-install more extensions (hstore, citext, pg_trgm, etc.) in template1. This avoids the PPA dependency but limits users to a fixed set of extensions.
+
+#### Database Appliance Validation (2026-05-04)
+
+Tested all four database appliances on a single-node Vagrant cluster (Ubuntu Noble, `demo.localflynn.com`).
+
+**PostgreSQL 16 — PASS**
+- Provisioned via `flynn resource add postgres`; CREATE TABLE, INSERT, SELECT all work
+- Extensions: `uuid-ossp`, `pgcrypto` work (`CREATE EXTENSION` + function calls verified)
+- `pg_dump` works (verified via direct `nsenter` into container)
+- Data persists across process kill + scheduler restart
+- No code changes required
+
+**MariaDB 10.11 — PASS (with fixes)**
+- MariaDB 10.11 defaults `root@localhost` to `unix_socket` auth plugin. Since `flynn-mariadb` runs as OS user `mysql` (not `root`), root cannot authenticate via TCP or socket (UID mismatch). This caused `Error 1045: Access denied` during both initial setup and health checks.
+- **Fix 1** (`process.go`): Start with `--skip-grant-tables` during initial setup, `FLUSH PRIVILEGES` to re-enable the privilege system, create the `flynn` user, then restart without `--skip-grant-tables`. The `start()` function accepts `extraArgs ...string` for this.
+- **Fix 2** (`process.go`): Delete anonymous users (`''@'localhost'`, `''@'<hostname>'`) created by `mysql_install_db`. MariaDB's auth matching prefers `''@'localhost'` (more specific host) over `'flynn'@'%'`, causing "Access denied" even with correct credentials.
+- **Fix 3** (`process.go`): Health check uses `root@tcp(...)` when `--skip-grant-tables` is active (root is the only user that exists at that point).
+- **Fix 4** (`process.go`): Semi-sync plugin install (`semisync_master.so`, `semisync_slave.so`) made non-fatal — the `.so` files don't exist in MariaDB 10.11 (feature is compiled into the server since 10.3+).
+- **Fix 5** (`process.go`): Second `FLUSH PRIVILEGES` after user creation to ensure changes are visible on restart.
+- **Fix 6** (`process.go`): `db.SetMaxOpenConns(1)` to force single connection reuse after `FLUSH PRIVILEGES` re-enables auth (new connections would fail since root uses `unix_socket`).
+- After fixes: provisioning, CREATE TABLE, INSERT, SELECT, process kill + restart, data persistence all verified.
+
+**MongoDB 6.0/7.0/8.0 — BLOCKED**
+- **Missing `mongod` binary**: The base image build didn't include the `mongodb-org-server` package (APT repo config was added but install failed). Fixed by extracting `mongod` from the deb package and adding it to the base squashfs layer.
+- **Missing `mongodb` system user**: Similar to MariaDB — the `start.sh` does `chown mongodb:mongodb` and `sudo -u mongodb`, but the user doesn't exist in the container. Fixed by adding `useradd` to `start.sh`.
+- **OP_QUERY wire protocol removed**: The Flynn MongoDB appliance uses `gopkg.in/mgo.v2` (2016-era driver) which communicates exclusively via `OP_QUERY`. MongoDB 5.1+ deprecated `OP_QUERY` for non-`isMaster` commands, and 6.0+ rejects it entirely. The health check (`mgo.DialWithInfo` which sends `OP_QUERY` ping) fails with "Unsupported OP_QUERY command: ping". This affects ALL operations, not just the health check — the entire `mgo` driver is incompatible with MongoDB 5.1+.
+- **To fix**: Replace `gopkg.in/mgo.v2` with the official `go.mongodb.org/mongo-driver` (`go.mongodb.org/mongo-driver/v2`). This is a significant refactor affecting `appliance/mongodb/process.go`, `replset.go`, `handler.go`, and the test files. The `mgo` Session API is fundamentally different from the official driver's Collection/Client API.
+- **Alternative**: Use MongoDB 5.0 (last version with full OP_QUERY support), but 5.0 reached EOL in October 2024 and has no Ubuntu Noble packages.
+
+**Redis 7.0 — PASS**
+- Redis is a single-process appliance (not sirenia-based). Each provisioned instance gets its own Flynn app.
+- Provisioned via `flynn resource add redis`; SET, GET, LPUSH, LRANGE all work
+- Data persists across process kill + restart (after `BGSAVE` or with default save intervals)
+- No code changes required
 
 ## Phase 7: TUF Distribution — HTTP Frontend with IPFS Backend
 
