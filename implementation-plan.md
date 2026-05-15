@@ -534,7 +534,7 @@ The TUF `timestamp.json` expired (2026-04-17T17:04:28Z), blocking `flynn-host do
 - [x] Configure NAT/masquerade for container internet access (2026-04-18) — see "Container NAT Fix" above
 - [x] Re-enable integration test suite on single-node Vagrant cluster (2026-05-03) — see "Single-Node Vagrant Integration Tests" below
 - [x] Validate database appliances (PostgreSQL, MariaDB, MongoDB, Redis) — start/stop, data persistence, failover (2026-05-04) — see "Database Appliance Validation" below
-- [ ] Restore pgextwlist and TimescaleDB support (see above)
+- [x] Restore pgextwlist and TimescaleDB support (2026-05-15) — see "pgextwlist / TimescaleDB Restoration" below
 - [x] Build missing packages layers for remaining images — gitreceive/taffy (git layer `8152fe02`, 19MB), slugbuilder-24 (git+ruby+daemontools+pigz+jq+curl + 5 Heroku buildpacks, `b620d70b`, 103MB), slugrunner-24 (ruby for Procfile parsing, `8fc1d819`, 15MB). Redis and MongoDB don't need packages layers (validated 2026-05-04). See "Git Push Pipeline Validation" below.
 - [x] Migrate MongoDB driver from `gopkg.in/mgo.v2` to `go.mongodb.org/mongo-driver` (required for MongoDB 5.1+ compatibility) — (2026-05-04, commits `44a63915`, `6cfa3202`). See "Database Appliance Validation" below.
 - [x] Publish patched `flynn-host` binary via TUF (2026-05-05) — included in v20260505.0 release
@@ -567,22 +567,17 @@ The TUF `timestamp.json` expired (2026-04-17T17:04:28Z), blocking `flynn-host do
 
 **Key decision**: The `flynn-host` binary re-execution problem (version mismatch → downloads TUF binary → re-executes with old code) is solved by building with matching version ldflags. This should be automated in the CI workflow.
 
-#### pgextwlist / TimescaleDB Restoration
+#### pgextwlist / TimescaleDB Restoration (Complete, 2026-05-15)
 
-**Current state**: pgextwlist and TimescaleDB config is preserved in `process.go` (`shared_preload_libraries`, `local_preload_libraries`, extension whitelist), but the actual PG16-compatible packages are not installed in the Noble base layer. The `installExtensionsInTemplate()` workaround pre-installs `uuid-ossp` and `pgcrypto` in `template1`, covering Flynn's internal needs (controller migrations, blobstore).
+**Resolution**: Both `postgresql-16-pgextwlist` (v1.19, from PGDG apt repo) and `timescaledb-2-postgresql-16` (v2.27.0, from TimescaleDB packagecloud repo) are available for Ubuntu 24.04 Noble. No custom PPAs needed — pgextwlist is in the official PGDG repo.
 
-**What this disables**: End-user applications can no longer self-serve `CREATE EXTENSION` for the ~30 extensions that were previously whitelisted by pgextwlist (hstore, citext, postgis, pg_trgm, plv8, etc.). Any app that relies on these will get a permission error. TimescaleDB is also unavailable, though no Flynn component uses it.
-
-**Why it was necessary**: The postgres packages layer does not include the third-party PPAs that provide `postgresql-16-pgextwlist` (pgextwlist PPA) and `timescaledb-2-postgresql-16` (TimescaleDB PPA). PostgreSQL crashes fatally if `shared_preload_libraries` or `local_preload_libraries` references a missing `.so` file.
-
-**To restore full functionality**:
-- [ ] Add TimescaleDB and pgextwlist PPAs to the postgres packages layer build (Ubuntu Noble)
-- [ ] Install `postgresql-16-pgextwlist` and optionally `timescaledb-2-postgresql-16`
-- [ ] Re-enable `ExtWhitelist: true` (and optionally `TimescaleDB: true`) in `main.go`
-- [ ] Remove the `installExtensionsInTemplate()` workaround from `process.go` (pgextwlist handles permissions natively)
+**Changes**:
+- [x] Add TimescaleDB repo and pgextwlist to the postgres packages layer build (`appliance/postgresql/img/packages.sh`)
+- [x] Install `postgresql-16-pgextwlist` and `timescaledb-2-postgresql-16`
+- [x] Re-enable `ExtWhitelist: true` and `TimescaleDB: true` in `cmd/flynn-postgres/main.go`
+- [x] Keep `installExtensionsInTemplate()` — still useful to pre-install `uuid-ossp` and `pgcrypto` in template1 (belt-and-suspenders; Flynn internals depend on these)
 - [ ] Rebuild postgres squashfs layer and update TUF repo
 
-**Alternative** (simpler, less flexible): Keep `ExtWhitelist: false` permanently and expand `installExtensionsInTemplate()` to pre-install more extensions (hstore, citext, pg_trgm, etc.) in template1. This avoids the PPA dependency but limits users to a fixed set of extensions.
 
 #### Git Push Pipeline Validation (2026-05-04)
 
