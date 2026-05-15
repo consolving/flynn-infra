@@ -79,3 +79,8 @@ Do not update these without understanding the custom patches in the Flynn forks.
 - `host/volume/zfs/` tests require ZFS and root access.
 - Test apps live in `test/apps/` (echoer, ping, signal, ish, etc.)
 - Integration test runner: `script/run-integration-tests` (boots full cluster first).
+
+## Git Workflow
+- **Feature branches**: Always create feature branches in the main repo (`flynn-dev`) AND in any submodules (`flynn/`, `flynn-tuf-repo/`) that will have changes. Use matching branch names.
+- **Pushing**: Always push submodules first, then the main repo. Never forget to push submodules — the main repo's submodule pointer must reference a commit that exists on the remote.
+- **Commit style**: Subsystem prefix required (e.g., `host: `, `controller: `, `docs: `).
