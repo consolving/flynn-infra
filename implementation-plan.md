@@ -113,7 +113,7 @@ Go 1.13 was 6+ years old and unsupported. Upgraded to Go 1.22.12 in a single jum
 - [x] Determine minimum viable Go version upgrade target (e.g., 1.21 for workspace support, or 1.22 for latest stdlib)
 - [x] Test compilation with the target Go version, fixing breakages iteratively
 - [x] Migrate base layer images from Ubuntu 18.04 Bionic to Ubuntu 24.04 Noble (see Phase 5.5 below)
-- [ ] Evaluate migrating from `vendor/` to Go module proxies (or keep vendored for reproducibility)
+- [x] Evaluate migrating from `vendor/` to Go module proxies — **Decision: keep vendored** (see below)
 - [ ] Update `libcontainer`/`runc` fork to a maintained version compatible with modern kernels
 
 Additionally completed:
@@ -144,9 +144,24 @@ Additionally completed:
 | `dbus` (v4→v5 shim) | Keep | Harmless. Will be eliminated when runc fork is updated to modern version. |
 | `coreos-pkg` (Flynn fork) | Keep | Module graph satisfier only. Will be eliminated when go-systemd upgraded to v22. |
 
-### Remaining Phase 5 Work (Deferred to Phase 6+)
+### vendor/ vs Go Module Proxies Evaluation (Complete, 2026-05-15)
 
-- **vendor/ vs Go modules**: Currently keeping `vendor/` for reproducibility. Re-evaluate when CI is fully operational.
+**Findings**:
+- `vendor/` is 22 MB, 2,848 files — small overhead
+- `go mod verify` passes — vendor is clean `go mod vendor` output, no manual patches
+- All 3 Flynn fork replace directives (`flynn/runc`, `flynn/coreos-pkg`, `godbus/dbus`) resolve on the Go module proxy (proxy.golang.org)
+- Build without vendor succeeds (`GOFLAGS=-mod=mod go build -o /tmp/flynn-cli ./cli` compiles cleanly)
+- 6 Flynn-owned packages (`go-check`, `go-docopt`, `go-p9p`, `go-tuf`, `que-go`, `tail`) all available on proxy
+
+**Decision: Keep `vendor/`**. Rationale:
+1. **Reproducibility** — vendor guarantees bit-identical builds regardless of proxy availability. The Flynn forks are hosted on GitHub under the `flynn` org (unmaintained); if repos are deleted or go-import paths break, proxy cache may eventually expire.
+2. **Minimal cost** — 22 MB is negligible in a repo that already has multi-GB TUF artifacts.
+3. **No friction** — `go mod vendor` produces the current tree exactly; no manual patches to maintain.
+4. **CI compatibility** — the existing CI workflow uses `-mod=vendor` implicitly; removing vendor would require proxy network access in CI containers.
+
+**If revisited later**: The migration path is trivial — delete `vendor/`, ensure CI has proxy access, done. No code changes needed.
+
+### Remaining Phase 5 Work (Deferred to Phase 6+)
 - **runc fork modernization**: The Flynn runc fork (`v1.0.0-rc1001`) is 6+ years behind on security patches. Upgrading requires extracting the veth/loopback networking into Flynn's own code (using `vishvananda/netlink` directly), then migrating to modern runc. This is a significant undertaking tied to Phase 6 cluster bootstrap work.
 - **~~Base layer migration~~**: Complete — migrated to Ubuntu 24.04 Noble in Phase 5.5.
 
@@ -371,8 +386,8 @@ Initially built with Ubuntu 18.04 Bionic base layers, then rebuilt with Ubuntu 2
 | flannel | 2: Noble base + binaries | `CGO_ENABLED=0`; unique VXLAN MAC fix; MAC reset after LinkSetUp fix |
 | router | 2: Noble base + binaries | `CGO_ENABLED=0`; `EXTERNAL_IP` registration fix |
 | gitreceive | 3: Noble base + git packages + binaries | Git packages layer (`apt-get install git`) |
-| slugbuilder | 3: Noble base + packages + binaries | Combined packages layer with git, ruby, daemontools, pigz, and Heroku buildpacks (heroku-24 stack) |
-| slugrunner | 3: Noble base + packages + binaries | Reused slugbuilder packages layer (ruby needed for Procfile parsing) |
+| slugbuilder | 3: Noble base + binaries + packages | Combined packages layer (`b620d70b`, 103MB) with git, ruby, daemontools, pigz, jq, curl, and 5 Heroku buildpacks (go, multi, ruby, nodejs, python). Packages layer LAST to override broken `build.sh` in binaries layer with fixed version (heroku-24 stack) |
+| slugrunner | 3: Noble base + binaries + packages | Ruby packages layer (`8fc1d819`, 15MB) needed for Procfile parsing via `/runner/init`. Packages layer LAST |
 | mariadb | Noble base + binaries | `mariabackup` migration for MariaDB 10.11 LTS |
 
 ### Git Push Pipeline Fix (2026-04-14)
@@ -520,10 +535,10 @@ The TUF `timestamp.json` expired (2026-04-17T17:04:28Z), blocking `flynn-host do
 - [x] Re-enable integration test suite on single-node Vagrant cluster (2026-05-03) — see "Single-Node Vagrant Integration Tests" below
 - [x] Validate database appliances (PostgreSQL, MariaDB, MongoDB, Redis) — start/stop, data persistence, failover (2026-05-04) — see "Database Appliance Validation" below
 - [ ] Restore pgextwlist and TimescaleDB support (see above)
-- [ ] Build missing packages layers for remaining images (redis, mongodb, taffy, gitreceive — `git` not in base layer)
-- [ ] Migrate MongoDB driver from `gopkg.in/mgo.v2` to `go.mongodb.org/mongo-driver` (required for MongoDB 5.1+ compatibility) — **DONE** (2026-05-04, commits `44a63915`, `6cfa3202`). See "Database Appliance Validation" below.
-- [ ] Publish patched `flynn-host` binary via TUF (currently deployed manually)
-- [ ] Full TUF repo rebuild with all Noble-based images and fixed binaries
+- [x] Build missing packages layers for remaining images — gitreceive/taffy (git layer `8152fe02`, 19MB), slugbuilder-24 (git+ruby+daemontools+pigz+jq+curl + 5 Heroku buildpacks, `b620d70b`, 103MB), slugrunner-24 (ruby for Procfile parsing, `8fc1d819`, 15MB). Redis and MongoDB don't need packages layers (validated 2026-05-04). See "Git Push Pipeline Validation" below.
+- [x] Migrate MongoDB driver from `gopkg.in/mgo.v2` to `go.mongodb.org/mongo-driver` (required for MongoDB 5.1+ compatibility) — (2026-05-04, commits `44a63915`, `6cfa3202`). See "Database Appliance Validation" below.
+- [x] Publish patched `flynn-host` binary via TUF (2026-05-05) — included in v20260505.0 release
+- [x] Full TUF repo rebuild with all Noble-based images and fixed binaries (2026-05-05) — see "Full TUF Rebuild v20260505.0" below
 - [x] Set up automated TUF timestamp refresh (CI cron job) to prevent metadata expiry (2026-05-03)
 
 #### Single-Node Vagrant Integration Tests (2026-05-03)
@@ -569,6 +584,36 @@ The TUF `timestamp.json` expired (2026-04-17T17:04:28Z), blocking `flynn-host do
 
 **Alternative** (simpler, less flexible): Keep `ExtWhitelist: false` permanently and expand `installExtensionsInTemplate()` to pre-install more extensions (hstore, citext, pg_trgm, etc.) in template1. This avoids the PPA dependency but limits users to a fixed set of extensions.
 
+#### Git Push Pipeline Validation (2026-05-04)
+
+Re-validated the full git push pipeline on the new single-node Vagrant cluster (rebuilt from scratch, not the earlier 5-node cluster). All packages layers were rebuilt from the Noble base layer using overlayfs+chroot on ZFS.
+
+**Packages layers built**:
+
+| Component | Hash | Size | Contents |
+|---|---|---|---|
+| gitreceive/taffy | `8152fe02b9e7c59e...` | 19 MB | `git 2.43.0` + dependencies |
+| slugbuilder-24 | `b620d70b61624f88...` | 103 MB | git, ruby, daemontools, pigz, jq, curl, 5 Heroku buildpacks (multi, ruby, nodejs, python, go), fixed `build.sh` |
+| slugrunner-24 | `8fc1d819e9458c03...` | 15 MB | ruby (needed by `/runner/init` for Procfile YAML parsing) |
+
+**Layer ordering discovery**: The slugbuilder binaries layer contains an old `build.sh` (missing `mkdir -p env_dir` before buildpack compile, uses undefined `${envdir}` variable). The packages layer must be ordered AFTER binaries (base → binaries → packages) so the fixed `build.sh` in the packages layer takes precedence via overlay mount order.
+
+**Deployment method**: Layers served via `python3 -m http.server 8888` on ZFS dataset `/flynn-default/build-tmp/`. New artifacts created via controller API with `layer_url_template: "http://192.168.50.11:8888/{id}.squashfs"`. Gitreceive release updated with new `SLUGBUILDER_24_IMAGE_ID` and `SLUGRUNNER_24_IMAGE_ID` env vars, formation updated to trigger restart.
+
+**End-to-end verification**: Simple Go web app (`net/http`, listens on `$PORT`, returns "hello from git push") pushed via `git push flynn master`. Full pipeline:
+1. gitreceive receives push, spawns slugbuilder job
+2. Go buildpack detects app, installs go1.22.12, compiles
+3. Slug uploaded to blobstore (3.8 MiB)
+4. Release created, web=1 scaled
+5. Slugrunner starts, `/runner/init` parses Procfile via ruby, runs app
+6. Health check passes (TCP on port 8080)
+7. App responds "hello from git push" on internal IP
+
+**Final artifact IDs** (single-node cluster):
+- Slugbuilder-24: `bf2b108c-3980-44bc-9f49-1603c3037268`
+- Slugrunner-24: `e4e01f58-99ac-4eb2-87d3-556f4ae6d0ef`
+- Gitreceive release: `3ae1616e-e692-444d-be7c-055d90e10a2c`
+
 #### Database Appliance Validation (2026-05-04)
 
 Tested all four database appliances on a single-node Vagrant cluster (Ubuntu Noble, `demo.localflynn.com`).
@@ -604,6 +649,32 @@ Tested all four database appliances on a single-node Vagrant cluster (Ubuntu Nob
 - Provisioned via `flynn resource add redis`; SET, GET, LPUSH, LRANGE all work
 - Data persists across process kill + restart (after `BGSAVE` or with default save intervals)
 - No code changes required
+
+#### Full TUF Rebuild v20260505.0 (2026-05-05)
+
+Complete rebuild of all TUF targets with Noble-based images, static container binaries, and all bug fixes from Phases 5-6.
+
+**Build changes**:
+- `script/bootstrap-build` updated: all 27 container binaries built with `CGO_ENABLED=0` (static linking for Noble glibc 2.39 compatibility). `flynn-host` remains `CGO_ENABLED=1` (requires libcontainer). CLI, examples, and release binaries remain dynamic.
+- All 35 binaries built with Go 1.22.12, version `v20260505.0` embedded via ldflags.
+
+**TUF targets published** (via `script/export-tuf`):
+- 347 image manifests (JSON), 738 layer entries (squashfs + JSON configs)
+- 5 versioned binaries/manifests per version (flynn-host.gz, flynn-init.gz, flynn-linux-amd64.gz, images.json.gz, bootstrap-manifest.json.gz)
+- Channel `stable` → `v20260505.0`
+- Timestamp v39, snapshot v36, both with 90-day expiry (2026-08-02)
+
+**Infrastructure**:
+- Squashfs layers + gzipped binaries uploaded to `dl.consolving.net` via rsync (149 files, 2.9 GB)
+- TUF metadata pushed to GitHub Pages (`consolving.github.io/flynn-tuf-repo`) with git-lfs for squashfs files (53 LFS objects, 1.1 GB)
+- Existing layer files on dl.consolving.net renamed from `{sha512}.{sha512_256}.squashfs` to `{sha512_256}.squashfs` to match layer URL template
+
+**Verification**:
+- TUF metadata live on GitHub Pages (timestamp v39, expires 2026-08-02)
+- All binaries accessible on dl.consolving.net (HTTP 200)
+- Sample layers accessible on dl.consolving.net (HTTP 200)
+- Image and layer manifests accessible on GitHub Pages (HTTP 200)
+- Channel `stable` resolves to `v20260505.0` via hash-prefixed URL
 
 ## Phase 7: TUF Distribution — HTTP Frontend with IPFS Backend
 
