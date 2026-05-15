@@ -711,3 +711,7 @@ Ubuntu 26.04 LTS will ship with OpenSSL 3.x supporting post-quantum algorithms (
 - ~~What is the target Linux distribution for the base layer images (Ubuntu Trusty/Xenial are EOL)?~~ **Resolved (2026-04-16)**: Ubuntu 24.04 LTS Noble Numbat. Vagrant test VMs also run Noble. Base layer images built via cloud image download or debootstrap (`builder/img/ubuntu-noble.sh`). Heroku stack migrated from heroku-18 to heroku-24.
 - ~~When should the runc fork be modernized?~~ **Partially resolved (2026-04-13)**: The vendored runc fork already has cgroups v2 controller code (`cpu_v2.go`, `memory_v2.go`, etc.) which works on Debian 13. The remaining concern is security patches (6+ years of unpatched CVEs), but the fork is functionally adequate for cluster bootstrap. Modernization is desirable but no longer blocking.
 - Should the self-hosting build be preserved long-term, or replaced entirely with container-based CI?
+
+## Housekeeping
+
+- [ ] Rename default branches from `master` to `main` across all repositories (`consolving/flynn`, `consolving/flynn-tuf-repo`) and update CI workflows, submodule refs, and any hardcoded branch references in scripts/docs
