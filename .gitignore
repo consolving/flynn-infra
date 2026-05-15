@@ -1,7 +1,3 @@
-# Separate git repositories (submodules or standalone)
-flynn/
-flynn-tuf-repo/
-
 # TUF private keys — NEVER commit these
 tuf-keys-secure/
 
