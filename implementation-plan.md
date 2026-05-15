@@ -714,4 +714,31 @@ Ubuntu 26.04 LTS will ship with OpenSSL 3.x supporting post-quantum algorithms (
 
 ## Housekeeping
 
-- [x] Rename default branches from `master` to `main` across all repositories (`consolving/flynn`, `consolving/flynn-tuf-repo`) and update CI workflows, submodule refs, and any hardcoded branch references in scripts/docs
+- [x] Rename default branches from `master` to `main` across all repositories (`consolving/flynn`, `consolving/flynn-tuf-repo`) and update CI workflows, submodule refs, and any hardcoded branch references in scripts/docs — completed 2026-05-15
+- [x] Clean up stale branches across all repos and remotes — completed 2026-05-15
+
+### Branch Rename and Cleanup (2026-05-15)
+
+**Scope**: Renamed default branch AND Flynn's user-facing deploy branch from `master` to `main`. Users now deploy with `git push flynn main`.
+
+**Code changes** (12 files in `flynn/` submodule, commit `c6d30a38`):
+
+| Category | Files | Changes |
+|---|---|---|
+| CI workflows | `ci.yml`, `docs.yml` | Branch triggers `master` → `main` |
+| Gitreceive hook | `server.go` | Deploy branch check `refs/heads/master` → `refs/heads/main`, error message updated |
+| Tests | `helper.go`, `test_cli.go`, `test_git_deploy.go`, `test_gitreceive.go`, `test_taffy_deploy.go` | All `git push flynn master` → `main`; `TestNonMasterPush` → `TestNonMainPush`; `git branch -m main` added after `git init` in test helper |
+| Scripts | `release-flynn`, `generate-backups` | Default branch references |
+| Utils | `cloner/flynn-clone.sh`, `bump-buildpacks/bump.go` | Branch name in user messages and API calls |
+
+**Infrastructure changes**:
+- `.gitmodules` updated to track `main` for flynn submodule
+- `consolving/flynn` GitHub: default branch changed to `main`, `master` deleted
+- `consolving/flynn` GitHub: 32 stale branches deleted (30 old upstream feature branches + `noble-migration-and-fixes` + `pg16-and-bootstrap-fixes`)
+- `mirrors/flynn` GitLab: default branch changed to `main`, 32 stale branches deleted
+- `consolving/flynn-infra` GitHub: 1 stale branch deleted (`feature/multi-origin-failover`)
+- `mirrors/flynn-infra` GitLab: 1 stale branch deleted (`vagrant-ubuntu-noble`)
+- Fixed origin fetch refspec in flynn submodule (`github/*` → `origin/*`)
+- All 5 local feature branches in flynn submodule deleted
+
+**Final state**: All three repos (`flynn-dev`, `flynn`, `flynn-tuf-repo`) have only `main` on all remotes (GitHub + GitLab).
