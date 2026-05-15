@@ -1,7 +1,7 @@
 [submodule "flynn"]
 	path = flynn
 	url = git@github.com:consolving/flynn.git
-	branch = master
+	branch = main
 [submodule "flynn-tuf-repo"]
 	path = flynn-tuf-repo
 	url = git@github.com:consolving/flynn-tuf-repo.git

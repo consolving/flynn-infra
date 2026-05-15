@@ -714,4 +714,4 @@ Ubuntu 26.04 LTS will ship with OpenSSL 3.x supporting post-quantum algorithms (
 
 ## Housekeeping
 
-- [ ] Rename default branches from `master` to `main` across all repositories (`consolving/flynn`, `consolving/flynn-tuf-repo`) and update CI workflows, submodule refs, and any hardcoded branch references in scripts/docs
+- [x] Rename default branches from `master` to `main` across all repositories (`consolving/flynn`, `consolving/flynn-tuf-repo`) and update CI workflows, submodule refs, and any hardcoded branch references in scripts/docs
