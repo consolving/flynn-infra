@@ -687,7 +687,7 @@ See `specs/tuf-ipfs-mirror.md` for full architecture and design rationale.
 - [ ] Initial IPFS upload and pin of TUF repository (~9.2 GB)
 - [ ] Configure DNSLink TXT record and CNAME (TTL=60s)
 - [ ] Install kubo on build server as gateway-only fallback node
-- [ ] Add multi-origin failover to `flynn-host download` (IPFS gateway → GitHub Pages)
+- [x] Add multi-origin failover to `flynn-host download` (IPFS gateway → GitHub Pages)
 - [ ] Add IPFS publish step to CI workflow (ipfs add → pin → update DNSLink)
 - [ ] Update `tup.config` and `builder/manifest.json` with new primary TUF URL
 - [ ] Test end-to-end: `flynn-host download` from IPFS-backed gateway
