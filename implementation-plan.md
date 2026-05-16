@@ -576,7 +576,7 @@ The TUF `timestamp.json` expired (2026-04-17T17:04:28Z), blocking `flynn-host do
 - [x] Install `postgresql-16-pgextwlist` and `timescaledb-2-postgresql-16`
 - [x] Re-enable `ExtWhitelist: true` and `TimescaleDB: true` in `cmd/flynn-postgres/main.go`
 - [x] Keep `installExtensionsInTemplate()` — still useful to pre-install `uuid-ossp` and `pgcrypto` in template1 (belt-and-suspenders; Flynn internals depend on these)
-- [ ] Rebuild postgres squashfs layer and update TUF repo
+- [x] Rebuild postgres squashfs layer and update TUF repo (2026-05-16) — new layer `5e2f8836` (362 MB) with pgextwlist v1.19, TimescaleDB v2.27.0, PostGIS 3.6.3, pgRouting 4.0.1; new image ID `aa8d3c06`; TUF metadata v42
 
 
 #### Git Push Pipeline Validation (2026-05-04)
