@@ -691,7 +691,7 @@ See `specs/tuf-ipfs-mirror.md` for full architecture and design rationale.
 
 - **Primary**: `dl.consolving.net` → Traefik (v2.11) → kubo gateway (port 8080) with `AddPrefix` middleware mapping `/{file}` → `/ipfs/{CID}/{file}`. Also serves HTTP (port 80) without TLS redirect for `dl.consolving.net` only.
 - **Active IPFS CID** (in Traefik): `bafybeibtwqraqap4yeslp3jwjdhnglwvubd3ahoaekad6vw5km75kf3kty` — 932 flat files (squashfs layers by `{sha512_256}.squashfs`, layer config JSONs by `{sha512_256}.json`, image manifest JSONs, gzipped binaries, channel files)
-- **IPFS gateway**: `https://ipfs.consolving.net/ipfs/{CID}/{filename}` (Traefik → kubo port 8080)
+- **IPFS gateway**: `https://ipfs.consolving.net/ipfs/{CID}` (Traefik → kubo port 8080) — serves any IPFS content by CID, no auth required
 - **IPFS Web UI**: `https://ui.ipfs.consolving.net` (basic auth protected, Traefik → kubo port 5001)
 - **IPFS API**: `https://ipfs.consolving.net/api/v0/` (basic auth protected, env var `IPFS_API_USERS` for htpasswd)
 - **Fallback**: GitHub Pages (`consolving.github.io/flynn-tuf-repo/repository`) — TUF metadata only, timestamp.json refreshed monthly via `.github/workflows/refresh-tuf.yml`
