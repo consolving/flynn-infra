@@ -212,3 +212,52 @@ Cross-arch emulation on x86_64 via QEMU TCG was tested with community boxes:
 - Native ARM64 Vagrant + libvirt VM testing with KVM
 - ARM64 Go builds (once Go is installed)
 - GPU-accelerated workloads (NVIDIA GB10)
+
+---
+
+## Remote Hosting Infrastructure
+
+Two Hetzner servers host the Flynn TUF distribution (IPFS + Traefik) and other consolving.net services.
+
+### host1 (`host1.consolving.net`)
+
+```sh
+ssh -p 24 root@host1.consolving.net
+```
+
+| Parameter | Value |
+|---|---|
+| Public IP | `94.130.66.166` |
+| SSH port | `24` |
+| Provider | Hetzner |
+
+**Flynn-related services**:
+- IPFS node (`ipfs_node`, kubo:latest) — primary content store for `dl.consolving.net`
+- Traefik v2.11 (`run1-consolving-net-traefik-1`) — reverse proxy with Let's Encrypt TLS
+- `dl.consolving.net` — serves TUF squashfs layers and binaries from IPFS via AddPrefix middleware
+- `ipfs.consolving.net` — IPFS gateway + API (basic auth)
+- `ui.ipfs.consolving.net` — kubo Web UI (basic auth)
+
+**Key paths**:
+- `/opt/containers/ipfs/compose.yaml` — IPFS container compose (Traefik labels)
+- `/opt/flynn-tuf-dl/sync-ipfs.sh` — sync new files to IPFS, update Traefik CID
+- `/opt/flynn-tuf-dl/release-and-sync.sh` — release wrapper (sync + pin on host2)
+- `/opt/flynn-tuf-dl/backup-ipfs.sh` — weekly CAR backup (cron: Sunday 03:00 UTC)
+- `/opt/flynn-tuf-dl/.ipfs-cid` — current active CID
+
+### host2 (`host2.consolving.net`)
+
+```sh
+ssh -p 24 root@host2.consolving.net
+```
+
+| Parameter | Value |
+|---|---|
+| SSH port | `24` |
+| Provider | Hetzner |
+
+**Flynn-related services**:
+- IPFS node (`ipfs_node`, kubo:latest) — mirror, pins same CID as host1 for redundancy
+
+**Key paths**:
+- `/opt/containers/ipfs/compose.yaml` — IPFS container compose (no Traefik labels)

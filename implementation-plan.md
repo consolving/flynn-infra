@@ -677,15 +677,64 @@ The TUF repository is currently hosted solely on GitHub Pages — a single point
 
 See `specs/tuf-ipfs-mirror.md` for full architecture and design rationale.
 
-- [ ] Register domain/subdomain for TUF distribution (e.g., `tuf.consolving.net`)
-- [ ] Set up Pinata account with dedicated gateway and custom domain
-- [ ] Initial IPFS upload and pin of TUF repository (~9.2 GB)
-- [ ] Configure DNSLink TXT record and CNAME (TTL=60s)
-- [ ] Install kubo on build server as gateway-only fallback node
+**Design decision (2026-05-17)**: `dl.consolving.net` serves files directly from IPFS via kubo gateway. Traefik `AddPrefix` middleware rewrites `/{file}` → `/ipfs/{CID}/{file}`. No nginx, no static files on disk. IPFS provides content-addressed storage with decentralized redundancy.
+
+**Current infrastructure** (verified 2026-05-17):
+
+| Component | host1 (`host1.consolving.net`, SSH port 24) | host2 (`host2.consolving.net`, SSH port 24) |
+|---|---|---|
+| IPFS node | kubo:latest (`ipfs_node`), 128 GB limit, 6.9 GB used | kubo:latest (`ipfs_node`), 128 GB limit, 3.1 GB used |
+| IPFS repo version | fs-repo@18 | fs-repo@18 |
+| Traefik | `run1-consolving-net-traefik-1` (v2.11, external) | External Traefik (no IPFS labels) |
+| Pinned CIDs | `bafybeia3adw7wyg25iy77exgt6ahvm3avqxg7dmtmdzrzmb3el6552yt5m` (930 files, active in Traefik) | `bafybeia3adw7wyg25iy77exgt6ahvm3avqxg7dmtmdzrzmb3el6552yt5m` (930 files, synced 2026-05-18) |
+
+- **Primary**: `dl.consolving.net` → Traefik (v2.11) → kubo gateway (port 8080) with `AddPrefix` middleware mapping `/{file}` → `/ipfs/{CID}/{file}`. Also serves HTTP (port 80) without TLS redirect for `dl.consolving.net` only.
+- **Active IPFS CID** (in Traefik): `bafybeia3adw7wyg25iy77exgt6ahvm3avqxg7dmtmdzrzmb3el6552yt5m` — 930 flat files (squashfs layers by `{sha512_256}.squashfs`, layer config JSONs by `{sha512_256}.json`, image manifest JSONs, gzipped binaries, channel files)
+- **IPFS gateway**: `https://ipfs.consolving.net/ipfs/{CID}/{filename}` (Traefik → kubo port 8080)
+- **IPFS Web UI**: `https://ui.ipfs.consolving.net` (basic auth protected, Traefik → kubo port 5001)
+- **IPFS API**: `https://ipfs.consolving.net/api/v0/` (basic auth protected, env var `IPFS_API_USERS` for htpasswd)
+- **Fallback**: GitHub Pages (`consolving.github.io/flynn-tuf-repo/repository`) — TUF metadata only, timestamp.json refreshed monthly via `.github/workflows/refresh-tuf.yml`
+- **Sync script**: `/opt/flynn-tuf-dl/sync-ipfs.sh /path/to/new/files` — exports existing MFS content to staging, merges new files, `ipfs add -r --cid-version=1`, updates Traefik AddPrefix CID in compose, recreates container, unpins old CID, runs GC. Current CID tracked in `/opt/flynn-tuf-dl/.ipfs-cid`.
+- **Release script**: `/opt/flynn-tuf-dl/release-and-sync.sh /path/to/new/layers` — calls `sync-ipfs.sh`, then pins new CID on host2 mirror and updates host2 MFS via SSH.
+- **Backup script**: `/opt/flynn-tuf-dl/backup-ipfs.sh` — exports current CID as CAR file to `/home/backup/ipfs/`, keeps 3 most recent, skips if CID already backed up. Cron: weekly Sunday 03:00 UTC.
+- **MFS**: Pinned directory linked at `/flynn-tuf` in MFS for Web UI visibility (host1 only; host2 has old CID)
+- **Compose**: host1: `/opt/containers/ipfs/compose.yaml` (Traefik labels for `ipfs.consolving.net`, `ui.ipfs.consolving.net`, `dl.consolving.net`, joins external `traefik_default` network). host2: `/opt/containers/ipfs/compose.yaml` (mirror node, no Traefik labels, joins external `traefik_default` network).
+- **Legacy files**: `/opt/flynn-tuf-dl/` also contains `docker-compose.yml` and `nginx.conf` from pre-IPFS nginx setup (unused, can be removed)
+- **Layer URL template**: `https://dl.consolving.net/{id}.squashfs` where `{id}` is the `sha512_256` hash (set in `script/export-tuf/main.go:118` and all image manifests in `build/manifests/`)
+
+**Content split** (what lives where):
+- **GitHub Pages** (`consolving.github.io/flynn-tuf-repo/repository`): TUF metadata (root.json, targets.json, snapshot.json, timestamp.json), image manifest JSONs, layer config JSONs, channel files, versioned release manifests. This is what the go-tuf client fetches for verification.
+- **IPFS / dl.consolving.net**: Squashfs layer files (`{sha512_256}.squashfs`), gzipped binaries (`{sha512}.flynn-host.gz`), layer config JSONs, image manifests. This is what `flynn-host download` fetches for actual content after TUF verification.
+- **Local TUF repo** (`flynn-tuf-repo/repository/targets/`): 937 files, 1.7 GB — authoritative source. Contains all targets in TUF directory structure (`layers/`, `images/`, `channels/`, `v20260*/`). Files on IPFS are a flattened version with layers renamed from `{sha512}.{sha512_256}.squashfs` to `{sha512_256}.squashfs`.
+
+**Known issues** (2026-05-18):
+1. ~~**host2 mirror is stale**~~: Fixed (2026-05-18). Both nodes now pin `bafybeia3adw7wyg25iy77exgt6ahvm3avqxg7dmtmdzrzmb3el6552yt5m`.
+2. ~~**IPFS node crash-loop**~~: Fixed (2026-05-17).
+3. **Local repo vs IPFS file count**: 937 files in local TUF repo vs 930 on IPFS — 7 files are duplicates across version directories (same hash, different logical paths) that flatten to the same filename.
+4. ~~**Old CID not garbage collected**~~: Fixed (2026-05-18). Old 465-file CID unpinned and GC'd.
+
+- [x] Initial IPFS upload and pin of TUF repository (465 files, 6.5 GB) — pinned on host1 kubo node (2026-05-17)
+- [x] Switched `dl.consolving.net` from nginx (static files) to IPFS gateway via Traefik AddPrefix (2026-05-17)
+- [x] Removed nginx container and 6.5 GB static files from `/opt/flynn-tuf-dl/data/` (2026-05-17)
+- [x] Created `/opt/flynn-tuf-dl/sync-ipfs.sh` — merges new files into IPFS, updates Traefik CID, unpins old (2026-05-17)
+- [x] kubo running on host1 as Docker container (`ipfs_node`), gateway via Traefik at `ipfs.consolving.net`, Web UI at `ui.ipfs.consolving.net`
+- [x] IPFS mirror on host2 — kubo container pinning same CID, 128 GB storage (2026-05-17)
+- [x] IPFS storage limit increased to 128 GB on both nodes (2026-05-17)
+- [x] CAR backup script with weekly cron on host1 (`/opt/flynn-tuf-dl/backup-ipfs.sh`, Sunday 03:00 UTC) (2026-05-17)
 - [x] Add multi-origin failover to `flynn-host download` (IPFS gateway → GitHub Pages)
-- [ ] Add IPFS publish step to CI workflow (ipfs add → pin → update DNSLink)
-- [ ] Update `tup.config` and `builder/manifest.json` with new primary TUF URL
-- [ ] Test end-to-end: `flynn-host download` from IPFS-backed gateway
+- [x] IPFS publish integrated into release process via `/opt/flynn-tuf-dl/release-and-sync.sh` — syncs new layers to IPFS on host1, updates Traefik CID, pins on host2 mirror (2026-05-17). No CI workflow needed since `export-tuf` runs on host1 where IPFS is local.
+- [x] Fixed host1 IPFS crash-loop — stale `repo.lock` owned by root, removed manually (2026-05-17)
+- [x] Re-sync IPFS from local TUF repo — flattened `repository/targets/` (layers renamed from `{sha512}.{sha512_256}.squashfs` to `{sha512_256}.squashfs`), rsynced to host1, replaced IPFS content (not merged). New CID: `bafybeia3adw7wyg25iy77exgt6ahvm3avqxg7dmtmdzrzmb3el6552yt5m` (930 files, 1.7 GB). Old stale 465-file CID unpinned and GC'd. (2026-05-18)
+- [x] Sync host2 mirror to latest CID — pinned `bafybeia3adw7wyg25iy77exgt6ahvm3avqxg7dmtmdzrzmb3el6552yt5m`, unpinned old 465-file CID, GC'd (2026-05-18). host2 repo: 5.1 GB.
+- [x] Unpin old CID on host1 — `bafybeicsslteizlnwnflm252evvtqwdkfq5scs56jv25x4fnlfgwrvi6l4` unpinned and GC'd (2026-05-18)
+- [x] Clean up legacy files — removed `/opt/flynn-tuf-dl/docker-compose.yml` and `/opt/flynn-tuf-dl/nginx.conf` (2026-05-18)
+- [x] Test end-to-end: `flynn-host download` from IPFS-backed gateway — verified 2026-05-18: fresh Vagrant VM downloads `flynn-host.gz` + all 21 images (squashfs layers) from `dl.consolving.net` (IPFS), bootstrap completes with all services healthy in ~24s. Required `TMPDIR` fix for small root filesystems (postgres layer is 364 MB).
+
+**Release workflow**:
+1. Build binaries: `script/bootstrap-build --version v<date>.0`
+2. Export TUF targets: `go run script/export-tuf/main.go ...` (generates squashfs layers + TUF metadata)
+3. Sync layers to IPFS: `/opt/flynn-tuf-dl/release-and-sync.sh /path/to/new/layers` (adds to IPFS, updates `dl.consolving.net` CID, pins on host2)
+4. Push TUF metadata to GitHub Pages: `cd flynn-tuf-repo && git push`
 
 ## Post-Quantum Cryptography Assessment (2026-05-04)
 
@@ -711,6 +760,7 @@ Ubuntu 26.04 LTS will ship with OpenSSL 3.x supporting post-quantum algorithms (
 
 - [x] Rename default branches from `master` to `main` across all repositories (`consolving/flynn`, `consolving/flynn-tuf-repo`) and update CI workflows, submodule refs, and any hardcoded branch references in scripts/docs — completed 2026-05-15
 - [x] Clean up stale branches across all repos and remotes — completed 2026-05-15
+- [ ] Reset `flynn-tuf-repo` GitHub repo and GitLab mirror — the `.git/` directory is 966 MB due to historical binary files (squashfs layers that were committed before IPFS migration). Since squashfs layers are now served from IPFS via `dl.consolving.net`, the repo only needs TUF metadata (root.json, targets.json, snapshot.json, timestamp.json), image manifest JSONs, layer config JSONs, channel files, and versioned release manifests. No git-lfs is currently configured (`.gitattributes` doesn't exist), but the git history still contains the large objects. Steps: (1) create a fresh repo with only current tree contents, (2) force-push to GitHub and GitLab, (3) update submodule ref in `flynn-dev`, (4) verify GitHub Pages still serves correctly, (5) verify `refresh-tuf.yml` workflow still runs
 
 ### Branch Rename and Cleanup (2026-05-15)
 

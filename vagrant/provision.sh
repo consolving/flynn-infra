@@ -323,9 +323,15 @@ install_flynn() {
 		local tmp
 		tmp="$(mktemp -d)"
 
-		if ! curl -fsSL -o "$tmp/flynn-host.gz" "${REPO_URL}/targets/flynn-host.gz"; then
-			rm -rf "$tmp"
-			fail "Failed to download flynn-host from ${REPO_URL}"
+		# Try dl.consolving.net first (IPFS-backed), fall back to TUF repo
+		local dl_url="https://dl.consolving.net/flynn-host.gz"
+		local tuf_url="${REPO_URL}/targets/flynn-host.gz"
+		if ! curl -fsSL -o "$tmp/flynn-host.gz" "$dl_url"; then
+			info "dl.consolving.net unavailable, trying TUF repo..."
+			if ! curl -fsSL -o "$tmp/flynn-host.gz" "$tuf_url"; then
+				rm -rf "$tmp"
+				fail "Failed to download flynn-host from both $dl_url and $tuf_url"
+			fi
 		fi
 
 		gunzip "$tmp/flynn-host.gz"
@@ -345,12 +351,19 @@ install_flynn() {
 		chmod +x /usr/local/bin/flynn-host
 	fi
 
+	# Use ZFS pool for temp files during download — the root filesystem may be
+	# too small for large layers (e.g., postgres at 364 MB).
+	local tmpdir="/flynn-default/tmp"
+	mkdir -p "$tmpdir"
+
 	info "Downloading Flynn components via flynn-host download..."
-	"$bootstrap_binary" download \
+	TMPDIR="$tmpdir" "$bootstrap_binary" download \
 		--repository "${REPO_URL}" \
 		--tuf-db "/etc/flynn/tuf.db" \
 		--config-dir "/etc/flynn" \
 		--bin-dir "/usr/local/bin"
+
+	rm -rf "$tmpdir"
 
 	# Ensure local binary takes precedence over TUF-downloaded version
 	if [[ -n "$LOCAL_BINARY" ]] && [[ -f "$LOCAL_BINARY" ]]; then
