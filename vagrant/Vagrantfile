@@ -159,6 +159,33 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
           echo "==> Bootstrap complete!"
           echo "    Cluster domain: #{CLUSTER_DOMAIN}"
           echo "    Dashboard:      https://dashboard.#{CLUSTER_DOMAIN}"
+
+          # Post-bootstrap: configure dnsmasq for wildcard *.demo.localflynn.com
+          # resolution AND discoverd service discovery forwarding.
+          DISCOVERD_IP=$(ss -tlnp | grep ':53 ' | grep discoverd | grep -oP '[\d.]+(?=:53)' | head -1)
+          if [[ -n "$DISCOVERD_IP" ]]; then
+            echo "==> Setting up dnsmasq with discoverd ($DISCOVERD_IP) forwarding"
+            apt-get install -y -qq dnsmasq >/dev/null 2>&1
+            cat > /etc/dnsmasq.d/flynn.conf <<DNSEOF
+address=/#{CLUSTER_DOMAIN}/#{NODE_IPS.first}
+server=$DISCOVERD_IP
+listen-address=127.0.0.1
+bind-interfaces
+DNSEOF
+            systemctl restart dnsmasq
+            echo "nameserver 127.0.0.1" > /etc/resolv.conf
+          else
+            echo "==> WARNING: Could not determine discoverd IP for DNS setup"
+          fi
+
+          # Install the Flynn CLI for the vagrant user
+          if [[ -f /usr/local/bin/flynn ]]; then
+            CONTROLLER_KEY=$(grep 'CONTROLLER_KEY=' /var/log/flynn/bootstrap.log 2>/dev/null | tail -1 | sed 's/.*CONTROLLER_KEY=//')
+            TLS_PIN=$(grep 'TLS_PIN=' /var/log/flynn/bootstrap.log 2>/dev/null | tail -1 | sed 's/.*TLS_PIN=//')
+            if [[ -n "$CONTROLLER_KEY" ]] && [[ -n "$TLS_PIN" ]]; then
+              su - vagrant -c "flynn cluster add -p '$TLS_PIN' default https://controller.#{CLUSTER_DOMAIN} '$CONTROLLER_KEY'" 2>/dev/null || true
+            fi
+          fi
         SCRIPT
       end
     end

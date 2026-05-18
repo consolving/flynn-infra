@@ -113,7 +113,11 @@ install_packages() {
 		coreutils \
 		e2fsprogs \
 		squashfs-tools \
+		dnsmasq \
 		zfsutils-linux
+
+	# Disable dnsmasq until post-bootstrap configures it with discoverd forwarding
+	systemctl disable --now dnsmasq 2>/dev/null || true
 
 	# Ubuntu Noble ships ZFS as a prebuilt kernel module — no DKMS needed.
 	info "Loading ZFS kernel module..."
@@ -405,6 +409,7 @@ Requires=zfs-mount.service
 
 [Service]
 Type=simple
+EnvironmentFile=-/etc/default/flynn-host
 ExecStart=/usr/local/bin/flynn-host ${daemon_args}
 Restart=on-failure
 RestartSec=5
@@ -426,6 +431,25 @@ EOF
 
 	systemctl daemon-reload
 	systemctl enable flynn-host.service
+
+	# Create environment file for flynn-host systemd unit
+	# TMPDIR: Use ZFS pool for temp files during layer downloads (root fs may be small)
+	if [[ ! -f /etc/default/flynn-host ]]; then
+		mkdir -p /flynn-default/tmp
+		cat > /etc/default/flynn-host <<-ENVEOF
+		TMPDIR=/flynn-default/tmp
+		ENVEOF
+	fi
+
+	# Increase inotify limits — each container's OOM notification on cgroups v2
+	# uses an inotify instance. Default of 128 is exhausted with 40+ containers.
+	if [[ ! -f /etc/sysctl.d/99-inotify.conf ]]; then
+		cat > /etc/sysctl.d/99-inotify.conf <<-SYSEOF
+		fs.inotify.max_user_instances=8192
+		fs.inotify.max_user_watches=1048576
+		SYSEOF
+		sysctl --system >/dev/null 2>&1
+	fi
 
 	info "flynn-host service enabled (not started — bootstrap will start it)"
 }
