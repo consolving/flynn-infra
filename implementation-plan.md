@@ -760,7 +760,7 @@ Ubuntu 26.04 LTS will ship with OpenSSL 3.x supporting post-quantum algorithms (
 
 - [x] Rename default branches from `master` to `main` across all repositories (`consolving/flynn`, `consolving/flynn-tuf-repo`) and update CI workflows, submodule refs, and any hardcoded branch references in scripts/docs — completed 2026-05-15
 - [x] Clean up stale branches across all repos and remotes — completed 2026-05-15
-- [ ] Reset `flynn-tuf-repo` GitHub repo and GitLab mirror — the `.git/` directory is 966 MB due to historical binary files (squashfs layers that were committed before IPFS migration). Since squashfs layers are now served from IPFS via `dl.consolving.net`, the repo only needs TUF metadata (root.json, targets.json, snapshot.json, timestamp.json), image manifest JSONs, layer config JSONs, channel files, and versioned release manifests. No git-lfs is currently configured (`.gitattributes` doesn't exist), but the git history still contains the large objects. Steps: (1) create a fresh repo with only current tree contents, (2) force-push to GitHub and GitLab, (3) update submodule ref in `flynn-dev`, (4) verify GitHub Pages still serves correctly, (5) verify `refresh-tuf.yml` workflow still runs
+- [x] Reset `flynn-tuf-repo` GitHub repo and GitLab mirror — `.git/` reduced from 966 MB to 103 MB by creating a fresh repo with only current tree contents (single commit). Force-pushed to GitHub (2026-05-18). GitLab mirror pending (branch protection, no API token available). GitHub Pages continues serving correctly. `refresh-tuf.yml` workflow unaffected (uses `contents: write` permission, commits to same branch).
 
 ### Branch Rename and Cleanup (2026-05-15)
 
