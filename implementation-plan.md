@@ -687,10 +687,10 @@ See `specs/tuf-ipfs-mirror.md` for full architecture and design rationale.
 | IPFS node | kubo:latest (`ipfs_node`), 128 GB limit, 6.9 GB used | kubo:latest (`ipfs_node`), 128 GB limit, 3.1 GB used |
 | IPFS repo version | fs-repo@18 | fs-repo@18 |
 | Traefik | `run1-consolving-net-traefik-1` (v2.11, external) | External Traefik (no IPFS labels) |
-| Pinned CIDs | `bafybeia3adw7wyg25iy77exgt6ahvm3avqxg7dmtmdzrzmb3el6552yt5m` (930 files, active in Traefik) | `bafybeia3adw7wyg25iy77exgt6ahvm3avqxg7dmtmdzrzmb3el6552yt5m` (930 files, synced 2026-05-18) |
+| Pinned CIDs | `bafybeibtwqraqap4yeslp3jwjdhnglwvubd3ahoaekad6vw5km75kf3kty` (932 files, active in Traefik) | `bafybeia3adw7wyg25iy77exgt6ahvm3avqxg7dmtmdzrzmb3el6552yt5m` (930 files, synced 2026-05-18) |
 
 - **Primary**: `dl.consolving.net` → Traefik (v2.11) → kubo gateway (port 8080) with `AddPrefix` middleware mapping `/{file}` → `/ipfs/{CID}/{file}`. Also serves HTTP (port 80) without TLS redirect for `dl.consolving.net` only.
-- **Active IPFS CID** (in Traefik): `bafybeia3adw7wyg25iy77exgt6ahvm3avqxg7dmtmdzrzmb3el6552yt5m` — 930 flat files (squashfs layers by `{sha512_256}.squashfs`, layer config JSONs by `{sha512_256}.json`, image manifest JSONs, gzipped binaries, channel files)
+- **Active IPFS CID** (in Traefik): `bafybeibtwqraqap4yeslp3jwjdhnglwvubd3ahoaekad6vw5km75kf3kty` — 932 flat files (squashfs layers by `{sha512_256}.squashfs`, layer config JSONs by `{sha512_256}.json`, image manifest JSONs, gzipped binaries, channel files)
 - **IPFS gateway**: `https://ipfs.consolving.net/ipfs/{CID}/{filename}` (Traefik → kubo port 8080)
 - **IPFS Web UI**: `https://ui.ipfs.consolving.net` (basic auth protected, Traefik → kubo port 5001)
 - **IPFS API**: `https://ipfs.consolving.net/api/v0/` (basic auth protected, env var `IPFS_API_USERS` for htpasswd)
@@ -706,12 +706,12 @@ See `specs/tuf-ipfs-mirror.md` for full architecture and design rationale.
 **Content split** (what lives where):
 - **GitHub Pages** (`consolving.github.io/flynn-tuf-repo/repository`): TUF metadata (root.json, targets.json, snapshot.json, timestamp.json), image manifest JSONs, layer config JSONs, channel files, versioned release manifests. This is what the go-tuf client fetches for verification.
 - **IPFS / dl.consolving.net**: Squashfs layer files (`{sha512_256}.squashfs`), gzipped binaries (`{sha512}.flynn-host.gz`), layer config JSONs, image manifests. This is what `flynn-host download` fetches for actual content after TUF verification.
-- **Local TUF repo** (`flynn-tuf-repo/repository/targets/`): 937 files, 1.7 GB — authoritative source. Contains all targets in TUF directory structure (`layers/`, `images/`, `channels/`, `v20260*/`). Files on IPFS are a flattened version with layers renamed from `{sha512}.{sha512_256}.squashfs` to `{sha512_256}.squashfs`.
+- **Local TUF repo** (`flynn-tuf-repo/repository/targets/`): 41 MB working tree — image manifests (`images/`, 388 JSON files, 2 MB), current release (`v20260518.0/`, 22 MB with binaries), channel file. Layers are NOT stored in git — served exclusively from IPFS. Git history squashed to single commit (233 KB `.git/`).
 
 **Known issues** (2026-05-18):
 1. ~~**host2 mirror is stale**~~: Fixed (2026-05-18). Both nodes now pin `bafybeia3adw7wyg25iy77exgt6ahvm3avqxg7dmtmdzrzmb3el6552yt5m`.
 2. ~~**IPFS node crash-loop**~~: Fixed (2026-05-17).
-3. **Local repo vs IPFS file count**: 937 files in local TUF repo vs 930 on IPFS — 7 files are duplicates across version directories (same hash, different logical paths) that flatten to the same filename.
+3. **Local repo vs IPFS file count**: Local TUF repo git tree (41 MB) is a subset of IPFS content (932 files) — git only stores metadata and current version binaries; layers are exclusively on IPFS.
 4. ~~**Old CID not garbage collected**~~: Fixed (2026-05-18). Old 465-file CID unpinned and GC'd.
 
 - [x] Initial IPFS upload and pin of TUF repository (465 files, 6.5 GB) — pinned on host1 kubo node (2026-05-17)
@@ -725,9 +725,9 @@ See `specs/tuf-ipfs-mirror.md` for full architecture and design rationale.
 - [x] Add multi-origin failover to `flynn-host download` (IPFS gateway → GitHub Pages)
 - [x] IPFS publish integrated into release process via `/opt/flynn-tuf-dl/release-and-sync.sh` — syncs new layers to IPFS on host1, updates Traefik CID, pins on host2 mirror (2026-05-17). No CI workflow needed since `export-tuf` runs on host1 where IPFS is local.
 - [x] Fixed host1 IPFS crash-loop — stale `repo.lock` owned by root, removed manually (2026-05-17)
-- [x] Re-sync IPFS from local TUF repo — flattened `repository/targets/` (layers renamed from `{sha512}.{sha512_256}.squashfs` to `{sha512_256}.squashfs`), rsynced to host1, replaced IPFS content (not merged). New CID: `bafybeia3adw7wyg25iy77exgt6ahvm3avqxg7dmtmdzrzmb3el6552yt5m` (930 files, 1.7 GB). Old stale 465-file CID unpinned and GC'd. (2026-05-18)
+- [x] Re-sync IPFS from local TUF repo — flattened `repository/targets/` (layers renamed from `{sha512}.{sha512_256}.squashfs` to `{sha512_256}.squashfs`), rsynced to host1, replaced IPFS content (not merged). New CID: `bafybeibtwqraqap4yeslp3jwjdhnglwvubd3ahoaekad6vw5km75kf3kty` (932 files). Old stale CIDs unpinned and GC'd. (2026-05-18)
 - [x] Sync host2 mirror to latest CID — pinned `bafybeia3adw7wyg25iy77exgt6ahvm3avqxg7dmtmdzrzmb3el6552yt5m`, unpinned old 465-file CID, GC'd (2026-05-18). host2 repo: 5.1 GB.
-- [x] Unpin old CID on host1 — `bafybeicsslteizlnwnflm252evvtqwdkfq5scs56jv25x4fnlfgwrvi6l4` unpinned and GC'd (2026-05-18)
+- [x] Unpin old CID on host1 — old CIDs unpinned and GC'd (2026-05-18)
 - [x] Clean up legacy files — removed `/opt/flynn-tuf-dl/docker-compose.yml` and `/opt/flynn-tuf-dl/nginx.conf` (2026-05-18)
 - [x] Test end-to-end: `flynn-host download` from IPFS-backed gateway — verified 2026-05-18: fresh Vagrant VM downloads `flynn-host.gz` + all 21 images (squashfs layers) from `dl.consolving.net` (IPFS), bootstrap completes with all services healthy in ~24s. Required `TMPDIR` fix for small root filesystems (postgres layer is 364 MB).
 
@@ -761,7 +761,7 @@ Ubuntu 26.04 LTS will ship with OpenSSL 3.x supporting post-quantum algorithms (
 
 - [x] Rename default branches from `master` to `main` across all repositories (`consolving/flynn`, `consolving/flynn-tuf-repo`) and update CI workflows, submodule refs, and any hardcoded branch references in scripts/docs — completed 2026-05-15
 - [x] Clean up stale branches across all repos and remotes — completed 2026-05-15
-- [x] Reset `flynn-tuf-repo` GitHub repo and GitLab mirror — `.git/` reduced from 966 MB to 103 MB by creating a fresh repo with only current tree contents (single commit). Force-pushed to GitHub (2026-05-18). GitLab mirror pending (branch protection, no API token available). GitHub Pages continues serving correctly. `refresh-tuf.yml` workflow unaffected (uses `contents: write` permission, commits to same branch).
+- [x] Reset `flynn-tuf-repo` GitHub repo and GitLab mirror — `.git/` reduced from 966 MB to 233 KB by squashing history into single commit, removing 1.5 GB `layers/` directory (served from IPFS), and removing old version directories (v20260416.0, v20260504.0, v20260505.0, v20260515.0). Working tree: 41 MB (only v20260518.0 binaries + image manifests). Force-pushed to both GitHub and GitLab mirror (2026-05-18). GitHub Pages continues serving correctly. `refresh-tuf.yml` workflow unaffected.
 
 ### Branch Rename and Cleanup (2026-05-15)
 
@@ -856,7 +856,44 @@ Without the complete build pipeline, approximately 80% of integration tests cann
 - 52 containers running stably
 
 **Recommendation**: Rather than fighting to make the full test suite work without the build system, focus on:
-1. Publishing the fixed `flynn-host` binary (with `filterOverlayResolvers()`) to TUF
-2. Rebuilding slugbuilder/slugrunner layers with all fixes and publishing to IPFS
-3. Making `provision.sh` set up discoverd DNS in `/etc/resolv.conf` automatically after bootstrap
+1. ~~Publishing the fixed `flynn-host` binary (with `filterOverlayResolvers()`) to TUF~~ Done (v20260518.0)
+2. ~~Rebuilding slugbuilder/slugrunner layers with all fixes and publishing to IPFS~~ Done (new artifacts with `layer_url_template`)
+3. ~~Making `provision.sh` set up discoverd DNS in `/etc/resolv.conf` automatically after bootstrap~~ Done (dnsmasq with wildcard + discoverd forwarding)
 4. Building the `test-apps` squashfs layers to enable the ~40 tests that previously passed on the 5-node cluster
+
+### TUF Release v20260518.0 (2026-05-18)
+
+Published new TUF release with DNS-fix `flynn-host` binary and updated tooling.
+
+**Binaries** (all built with Go 1.22.12, `CGO_ENABLED=0` for init/CLI, `CGO_ENABLED=1` for host):
+- `flynn-host` (10.5 MB gz) — includes `filterOverlayResolvers()` DNS recursion fix
+- `flynn-init` (6.1 MB gz) — static init binary
+- `flynn-linux-amd64` (6.3 MB gz) — static CLI binary
+
+**TUF metadata**: targets.json v2028, snapshot.json v42, timestamp.json v45. Channel `stable` → `v20260518.0`. Images.json and bootstrap-manifest.json unchanged from v20260515.0 (same system component images).
+
+**New slugbuilder/slugrunner artifacts** (controller-level, not TUF):
+- Slugbuilder-24 artifact: `17590513-3c00-4246-8e3d-829f37dd5ebe` — layer `fb28c5d292ce037efabb72256a4dc1d6dc06de6ab7be012fd4bdc924daa8564e` (14 MB)
+- Slugrunner-24 artifact: `41bc9ff8-478f-4206-abaf-297659b1b55c` — layer `3d7065b92d576d16961510c9056fc986c0d87ddc699fec3054b5537900494f8c` (4 KB)
+- Both include `layer_url_template: "https://dl.consolving.net/{id}.squashfs"` for IPFS download of uncached layers
+- Gitreceive release `36d2af5e-8547-4dc3-94a7-42049506cb24` updated with new artifact IDs
+
+**Verified end-to-end**: Fresh `git push flynn main` of Node.js app on Vagrant VM — flynn-host downloads uncached slugbuilder/slugrunner layers from IPFS via `layer_url_template`, builds app, deploys, serves traffic.
+
+### Vagrant DNS Fix — dnsmasq for Wildcard Resolution (2026-05-18)
+
+**Problem**: Apps deployed to Flynn (e.g., `layer-test.demo.localflynn.com`) are routable via the HTTP router (Host header matching), but DNS resolution inside the VM fails because:
+- `demo.localflynn.com` is not a real domain (NXDOMAIN from upstream DNS)
+- Discoverd only resolves `.discoverd` service names, not wildcard app domains
+- `/etc/hosts` doesn't support wildcards
+
+**Solution**: Install `dnsmasq` as a DNS frontend:
+- Resolves `*.demo.localflynn.com` → `192.168.50.11` (VM's static IP) via `address=/demo.localflynn.com/192.168.50.11`
+- Forwards all other queries to discoverd (`server=100.100.57.1`) for `.discoverd` name resolution and external DNS recursion
+- Listens on `127.0.0.1:53`, `/etc/resolv.conf` points to `127.0.0.1`
+
+**Files changed**:
+- `vagrant/Vagrantfile` — post-bootstrap installs and configures dnsmasq instead of raw discoverd DNS
+- `vagrant/provision.sh` — installs `dnsmasq` package (disabled until post-bootstrap), bumps `fs.inotify.max_user_instances` from 1024 to 8192 (dnsmasq requires inotify)
+
+**Verification**: `curl http://layer-test.demo.localflynn.com` → "layer test ok" (previously required explicit `Host:` header).
