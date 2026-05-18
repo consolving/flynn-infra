@@ -787,3 +787,32 @@ Ubuntu 26.04 LTS will ship with OpenSSL 3.x supporting post-quantum algorithms (
 - All 5 local feature branches in flynn submodule deleted
 
 **Final state**: All three repos (`flynn-dev`, `flynn`, `flynn-tuf-repo`) have only `main` on all remotes (GitHub + GitLab).
+
+### Node.js Git Push Pipeline — End-to-End Fix (2026-05-18)
+
+Re-validated and fixed the full `git push` → build → deploy pipeline for a Node.js app on a fresh single-node Vagrant cluster. Previous validation (2026-05-04) used Go buildpacks; this confirms the pipeline works for Node.js apps with `npm install`.
+
+**Test app**: `test-bp` — minimal Node.js app (`package.json` + `server.js`, responds "hello from flynn" on `$PORT`).
+
+**Issues fixed this session**:
+
+| Issue | Root Cause | Fix |
+|---|---|---|
+| flynn-host layer downloads filling root `/tmp` | `flynn-host` systemd unit had no `EnvironmentFile` directive; `TMPDIR=/var/lib/flynn/tmp` in `/etc/default/flynn-host` was ignored | Added `EnvironmentFile=-/etc/default/flynn-host` to systemd unit, restarted |
+| `setuidgid` shim broken | Shim had `exec ""` instead of `exec "$@"` — all `run_unprivileged` calls in `build.sh` silently did nothing | Fixed in slugbuilder squashfs layer (`/usr/bin/setuidgid`) |
+| Node.js buildpack compile script broken | Variable interpolation empty (`BUILD_DIR=`, `NODE_URL=` with no expansion) | Rewrote compile script with proper `$1`/`$2`/`$3` args and `${NODE_VERSION}` interpolation |
+| Node.js download fails from containers | Containers can't resolve/reach `nodejs.org` (DNS/TLS issues in container environment) | Serve Node.js tarball from host HTTP server (`192.168.50.1:8888`), compile script points there |
+| `build.sh` uses `ruby` for YAML parsing | Ruby not installed in slugbuilder or slugrunner layers; `set -eo pipefail` causes exit on ruby failure | Replaced ruby calls in `build.sh` with shell `grep`/`sed` for Procfile and `.release` parsing |
+| `pigz` not found | Build cache upload (`tar | pigz | curl`) fails without pigz binary | Added `/usr/bin/pigz` shim that delegates to `gzip` |
+| Slugrunner `/runner/init` uses ruby | Ruby YAML parsing for config_vars, Procfile process types, and `.release` default_process_types | Rewrote `/runner/init` in pure bash — regex-based YAML parsing for simple key-value structures |
+| `/etc/hosts` missing IP for `git.demo.localflynn.com` | flynn-host restart cleared DNS entries | Re-added `192.168.50.11 git.demo.localflynn.com` to `/etc/hosts` |
+
+**Deployment method**: Squashfs layers replaced in-place on ZFS zvols via `dd` + remount. Two layers modified:
+- `a1636ecc` (slugbuilder-24, 15MB) — fixed `setuidgid`, `build.sh`, compile script, added pigz shim
+- `75cf6d2c` (slugrunner-24, 4KB) — replaced `/runner/init` with pure-bash version
+
+**End-to-end result**: `git push flynn main` → Node.js detected → npm install (0 deps, 691ms) → slug uploaded (35 MB) → release created → web=1 scaled → `curl http://test-bp.demo.localflynn.com` returns "hello from flynn".
+
+**Implications for TUF rebuild**: The slugbuilder and slugrunner packages layers need to be rebuilt with these fixes before the next `export-tuf` run. Specifically:
+- Slugbuilder packages layer (`b620d70b`) needs: fixed `setuidgid`, fixed compile scripts with local/CDN Node.js URL, `pigz` shim, shell-based YAML parsing in `build.sh`
+- Slugrunner packages layer (`8fc1d819`) needs: pure-bash `/runner/init` (removes ruby dependency entirely — the 15MB ruby packages layer can be eliminated)
