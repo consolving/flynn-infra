@@ -397,7 +397,9 @@ install_systemd_unit() {
 
 	info "Installing flynn-host systemd unit..."
 
-	local daemon_args="daemon --external-ip=${NODE_IP} --listen-ip=0.0.0.0"
+	local hostname
+	hostname=$(hostname)
+	local daemon_args="daemon --id=${hostname} --external-ip=${NODE_IP} --listen-ip=0.0.0.0 --tags=host_id=${hostname}"
 
 	cat >"$unit_file" <<EOF
 [Unit]
