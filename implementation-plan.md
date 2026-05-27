@@ -948,3 +948,39 @@ Successfully ran integration tests against the live single-node Vagrant cluster 
 3. `~/.flynnrc` configured with controller key and TLS pin
 4. Schema directory at `../schema` relative to test CWD
 5. `dnsmasq` configured for wildcard DNS (already in `provision.sh`/`Vagrantfile`)
+
+### TUF Metadata on IPFS — Full Mirror at tuf.consolving.net (2026-05-27)
+
+**Goal**: Eliminate GitHub Pages as single point of failure by serving both TUF metadata and content from IPFS. `tuf.consolving.net` becomes a full TUF repository mirror (metadata + layers), with DNS round-robin across host1 and host2.
+
+**DNS**: `tuf.consolving.net` — A records pointing to host1 and host2 (round-robin), configured at domain.pixelx.de.
+
+**Code change**: `tufconfig.Mirrors` updated to try `tuf.consolving.net/repository` first, fall back to GitHub Pages.
+
+**IPFS CID**: `bafybeignvy33g2lz4kqzjvwjl4kpghx6fgwnonrwc356qe3zfam7fqetz4` — structured as `repository/{root,targets,snapshot,timestamp}.json` + `repository/targets/{sha256}.squashfs` (932 target files + 4 metadata files).
+
+**Infrastructure**:
+- host1: Traefik routes for `tuf.consolving.net` (AddPrefix → `/ipfs/{CID}`) and `dl.consolving.net` (AddPrefix → `/ipfs/{CID}/repository/targets`)
+- host2: Traefik route for `tuf.consolving.net` (AddPrefix → `/ipfs/{CID}`), same pinned CID
+- TLS certs synced between hosts via `/opt/scripts/sync-traefik-certs.py` (cron every 6h on host1). Handles DNS round-robin + TLS-ALPN-01 challenge incompatibility by distributing certs after issuance.
+- SSH key: host1 → host2 (root, port 24) for cert sync and IPFS pin replication
+- TUF metadata sourced from `/opt/flynn-tuf-repo` (git clone on host1)
+
+**Completed tasks**:
+
+- [x] Restructure IPFS content — `repository/` prefix with TUF metadata + `repository/targets/` for layers (2026-05-27)
+- [x] Add Traefik route for `tuf.consolving.net` on host1 — AddPrefix middleware in `/opt/containers/ipfs/compose.yaml` (2026-05-27)
+- [x] Add Traefik route for `tuf.consolving.net` on host2 — same labels in host2's compose.yaml (2026-05-27)
+- [x] TLS cert sync between hosts — `/opt/scripts/sync-traefik-certs.py` merges certs keeping longest validity, cron every 6h (2026-05-27)
+- [x] Restore `dl.consolving.net` Traefik route (was missing) — AddPrefix maps to `/ipfs/{CID}/repository/targets` (2026-05-27)
+- [x] Update `sync-ipfs.sh` to maintain `repository/` directory structure and refresh TUF metadata from git (2026-05-27)
+- [x] Update `release-and-sync.sh` to update host2 Traefik CID and recreate container (2026-05-27)
+- [x] Verify: `curl https://tuf.consolving.net/repository/root.json` returns 200 from both hosts (2026-05-27)
+- [x] `tufconfig.Mirrors` updated to try `tuf.consolving.net/repository` first, GitHub Pages fallback (2026-05-27)
+- [x] Old flat CID (`bafybeibtwqraqap4yeslp3jwjdhnglwvubd3ahoaekad6vw5km75kf3kty`) unpinned and GC'd on both hosts (2026-05-27)
+- [x] Rebuild `flynn-host` binary with `tufconfig.Mirrors` update — targets.json v2029, snapshot v44, timestamp v47, pushed to GitHub (2026-05-27)
+
+**Remaining tasks**:
+
+- [x] Update `refresh-tuf.yml` GitHub Actions workflow to trigger IPFS re-sync after monthly `timestamp.json` refresh — webhook configured, ready (2026-05-27)
+- [ ] Verify end-to-end: `flynn-host download` from IPFS-backed TUF mirror — pending: requires Vagrant cluster bootstrap with updated binary (2026-05-27)
