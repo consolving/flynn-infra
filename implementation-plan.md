@@ -983,4 +983,4 @@ Successfully ran integration tests against the live single-node Vagrant cluster 
 **Remaining tasks**:
 
 - [x] Update `refresh-tuf.yml` GitHub Actions workflow to trigger IPFS re-sync after monthly `timestamp.json` refresh — webhook configured, ready (2026-05-27)
-- [ ] Verify end-to-end: `flynn-host download` from IPFS-backed TUF mirror — pending: requires Vagrant cluster bootstrap with updated binary (2026-05-27)
+- [ ] Verify end-to-end: `flynn-host download` from IPFS-backed TUF mirror — partially verified (2026-05-27): new binary successfully initializes TUF client, resolves metadata from both `tuf.consolving.net` and GitHub Pages, but requires `v20260527.0` release artifacts (not yet published to TUF/repo). Full e2e needs: (a) IPFS sync of new metadata on host1, (b) publish v20260527.0 release via `export-tuf`, (c) bootstrap Vagrant cluster with new binary.
