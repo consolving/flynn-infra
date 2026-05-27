@@ -181,17 +181,19 @@ The IPFS directory mirrors the TUF repository exactly:
 
 ## Implementation Steps
 
-1. [ ] Register domain / subdomain for TUF distribution (e.g., `tuf.consolving.net`)
-2. [ ] Set up Pinata account (Pro plan) with dedicated gateway and custom domain
-3. [ ] Initial IPFS upload: `ipfs add -r --cid-version=1` the TUF repository
-4. [ ] Pin root CID on Pinata
-5. [ ] Configure DNSLink TXT record and CNAME
-6. [ ] Verify HTTP access: `curl https://tuf.consolving.net/repository/root.json`
-7. [ ] Install kubo on build server, configure as gateway-only, pin same CID
-8. [ ] Add multi-origin failover to `flynn-host download` (try IPFS gateway first, fall back to GitHub Pages)
-9. [ ] Add IPFS publish step to CI workflow
-10. [ ] Update `tup.config` and `builder/manifest.json` with new primary TUF URL
-11. [ ] Test end-to-end: `flynn-host download` from IPFS-backed gateway
+1. [x] Register domain / subdomain for TUF distribution — `dl.consolving.net` (content), `tuf.consolving.net` (full TUF mirror, DNS round-robin to host1+host2)
+2. ~~Set up Pinata account~~ — skipped in favor of self-hosted kubo on two Hetzner servers (host1+host2)
+3. [x] Initial IPFS upload: `ipfs add -r --cid-version=1` — 932 files pinned on host1 (2026-05-17)
+4. [x] Pin root CID on mirror — host2 pins same CID (2026-05-18)
+5. [ ] Configure DNSLink TXT record — not used; Traefik AddPrefix with hardcoded CID instead
+6. [ ] Verify HTTP access: `curl https://tuf.consolving.net/repository/root.json` — pending: requires TUF metadata in IPFS content
+7. [x] Install kubo on build server — kubo running on host1 and host2 as Docker containers
+8. [x] Add multi-origin failover to `flynn-host download` — `tufconfig.Mirrors` tries IPFS first, GitHub Pages fallback
+9. [x] IPFS publish integrated into release process via `release-and-sync.sh` on host1 (no CI needed)
+10. [ ] Restructure IPFS content to include TUF metadata under `repository/` prefix
+11. [ ] Add Traefik route for `tuf.consolving.net` on host1 and host2
+12. [ ] Update `sync-ipfs.sh` to include TUF metadata in each publish
+13. [x] Test end-to-end: `flynn-host download` from IPFS-backed gateway — verified 2026-05-18
 
 ## Cost
 
