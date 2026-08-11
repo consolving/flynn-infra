@@ -984,3 +984,23 @@ Successfully ran integration tests against the live single-node Vagrant cluster 
 
 - [x] Update `refresh-tuf.yml` GitHub Actions workflow to trigger IPFS re-sync after monthly `timestamp.json` refresh — webhook configured, ready (2026-05-27)
 - [ ] Verify end-to-end: `flynn-host download` from IPFS-backed TUF mirror — partially verified (2026-05-27): new binary successfully initializes TUF client, resolves metadata from both `tuf.consolving.net` and GitHub Pages, but requires `v20260527.0` release artifacts (not yet published to TUF/repo). Full e2e needs: (a) IPFS sync of new metadata on host1, (b) publish v20260527.0 release via `export-tuf`, (c) bootstrap Vagrant cluster with new binary.
+
+
+### IPFS-Backed TUF Mirror — End-to-End Cluster Verification (2026-08-11)
+**Goal**: Close the last open Phase 7 item by verifying a real cluster boot against the IPFS-backed TUF mirror.
+
+**Mirror verification (dev-machine, direct `flynn-host download`)**:
+- New binary v20260527.0 (tufconfig.Mirrors: `tuf.consolving.net/repository` first, GitHub Pages fallback) — full component download (taffy, tarreceive, mongodb, router, slugbuilder-14, slugrunner-14, updater, logaggregator, postgres, redis, mariadb + all layers) succeeded from the IPFS mirror on the FIRST mirror; no "trying mirror" fallback in logs.
+- v20260518.0 binary `download` also works (GitHub path).
+- Both mirrors serve: root.json, timestamp v53 (expires 2026-10-30), consistent-snapshot `97f6b0c7...targets.json` (v12), `7cf80012...bootstrap-manifest.json.gz` (v20260518.0), `1a59d249...flynn-host.gz` (v20260527.0).
+
+**Cluster boot test (single-node, rebuilt fresh)**:
+- Destroyed stale node1 and rebuilt: `vagrant destroy -f node1 && vagrant up node1 --provision` in `/root/GIT/flynn-dev/vagrant`.
+- Vagrant shell provisioner aborts when provision.sh restarts systemd-networkd (management SSH drops); the script itself continues in-VM and completes (flynn-host daemon up, systemd unit enabled). Bootstrap provisioner never runs — run manually:
+  `CLUSTER_DOMAIN=demo.localflynn.com flynn-host bootstrap --min-hosts=1 --peer-ips=192.168.50.11 --timeout=600`
+- Result: bootstrap **complete**, 15 apps up (controller scheduler/web/worker, router, postgres, discoverd, gitreceive, blobstore, mongodb, mariadb, redis, taffy, tarreceive, logaggregator, flannel, status). All jobs `up`.
+- Dev-machine CLI connects: `/usr/local/bin/flynn apps`, `flynn -a <app> ps`. New cluster creds written to `/root/.flynnrc`.
+- TUF key/creds: Key `9ca70541ad189246633b0fcb88c4c7a4`, TLSPin `G+cyhnxjBHLFRtJ3Q+BGdo7Le1SWAXnOt2folTF0+7I=` (also in /var/log/flynn/bootstrap.log in VM).
+
+**Known issue — stale `dl.consolving.net/flynn-host.gz`**:
+- `dl.consolving.net/flynn-host.gz` still serves the OLD v20260518.0 binary (sha512 `cdf715ab...`) while targets.json points `/flynn-host.gz` → `1a59d249...` (v20260527.0). Provision works anyway (binary only used for the download step; TUF-installed components + bootstrap verified), but the IPFS pin behind dl.consolving.net should be re-synced so the "current" flynn-host.gz matches metadata.
