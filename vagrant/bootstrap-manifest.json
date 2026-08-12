@@ -1,0 +1,745 @@
+[
+  {
+    "id": "require-env",
+    "action": "require-env",
+    "vars": ["CLUSTER_DOMAIN"]
+  },
+  {
+    "id": "resource-check",
+    "action": "resource-check",
+    "ports": [
+      { "port": 80 },
+      { "port": 443 },
+      { "port": 5002 },
+      { "port": 1111 }
+    ]
+  },
+  {
+    "id": "discoverd",
+    "app": {
+      "name": "discoverd",
+      "meta": {
+        "flynn-system-app": "true",
+        "flynn-system-critical": "true"
+      }
+    },
+    "action": "run-app",
+    "release": {
+      "env": {
+        "DISCOVERD_PEERS": "{{ range $ip := .SortedHostIPs }}{{ $ip }}:1111,{{ end }}",
+        "DISCOVERD": "none",
+        "DEBUG": "{{ getenv \"DEBUG\" }}"
+      },
+      "processes": {
+        "app": {
+          "ports": [{"port": 1111, "proto": "tcp"}, {"port": 53, "proto": "tcp"}],
+          "volumes": [{"path": "/data"}],
+          "host_network": true,
+          "omni": true,
+          "service": "discoverd"
+        }
+      }
+    },
+    "artifacts": [{"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=discoverd\u0026target=/images/c6f26d19f92f502ac5d64251d6908b0ad053ac2e91b4eb298a7a15690a12b1f8.json","meta":{"flynn.component":"discoverd","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/bin/start-discoverd"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"965f3e6184ca4339cc1d186b5c5c41619c0bf8e4845a5fb53beb433ed3dcb0cf"},"id":"965f3e6184ca4339cc1d186b5c5c41619c0bf8e4845a5fb53beb433ed3dcb0cf","length":2580480,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"b4174c575555e1acf714ca1ad8d455f0d11f6695229abefc8b91ab45d7c37331"},"id":"b4174c575555e1acf714ca1ad8d455f0d11f6695229abefc8b91ab45d7c37331","length":6758400,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"c6f26d19f92f502ac5d64251d6908b0ad053ac2e91b4eb298a7a15690a12b1f8"},"size":652,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}],
+    "processes": {
+      "app": 1
+    }
+  },
+  {
+    "id": "flannel",
+    "app": {
+      "name": "flannel",
+      "meta": {"flynn-system-app": "true"}
+    },
+    "action": "run-app",
+    "release": {
+      "env": {
+        "DISCOVERD": "none",
+        "BACKEND": "{{ getenv \"FLANNEL_BACKEND\" }}",
+        "NETWORK": "{{ getenv \"FLANNEL_NETWORK\" }}"
+      },
+      "processes": {
+        "app": {
+          "ports": [{"port": 5002, "proto": "tcp"}],
+          "host_network": true,
+          "omni": true
+        }
+      }
+    },
+    "artifacts": [{"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=flannel\u0026target=/images/d9a274594c58facbdd375f6b8fd4219dda3b2d5cae209aef736766070d48a448.json","meta":{"flynn.component":"flannel","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/bin/flannel-wrapper"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"965f3e6184ca4339cc1d186b5c5c41619c0bf8e4845a5fb53beb433ed3dcb0cf"},"id":"965f3e6184ca4339cc1d186b5c5c41619c0bf8e4845a5fb53beb433ed3dcb0cf","length":2580480,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"a4fee6f61d6d792a9416530512c4e33b4e19c12bba44a78a230fb021bdab650f"},"id":"a4fee6f61d6d792a9416530512c4e33b4e19c12bba44a78a230fb021bdab650f","length":11018240,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"d9a274594c58facbdd375f6b8fd4219dda3b2d5cae209aef736766070d48a448"},"size":653,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}],
+    "processes": {
+      "app": 1
+    }
+  },
+  {
+    "id": "wait-hosts",
+    "action": "wait-hosts"
+  },
+  {
+    "id": "pg-password",
+    "action": "gen-random"
+  },
+  {
+    "id": "postgres",
+    "app": {
+      "name": "postgres",
+      "meta": {
+        "flynn-system-app": "true",
+        "flynn-system-critical": "true"
+      }
+    },
+    "action": "run-app",
+    "release": {
+      "env": {
+        "FLYNN_POSTGRES": "postgres",
+        "PGDATABASE": "postgres",
+        "PGHOST": "leader.postgres.discoverd",
+        "PGUSER": "flynn",
+        "PGPASSWORD": "{{ (index .StepData \"pg-password\").Data }}",
+        "SIRENIA_PROCESS": "postgres",
+        "SINGLETON": "{{ .Singleton }}"
+      },
+      "processes": {
+        "postgres": {
+          "ports": [{"port": 5432, "proto": "tcp"}],
+          "volumes": [{"path": "/data"}],
+          "args": ["/bin/start-flynn-postgres", "postgres"],
+          "service": "postgres"
+        },
+        "web": {
+          "ports": [{"port": 80, "proto": "tcp"}],
+          "args": ["/bin/start-flynn-postgres", "api"]
+        }
+      }
+    },
+    "artifacts": [{"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=postgres\u0026target=/images/08281efced21e7969b3f3b1085b1cab51712d69a40e986908777dae6a8d0f5a4.json","meta":{"flynn.component":"postgres","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/bin/start-flynn-postgres"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a"},"id":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a","length":166764544,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"7d32a952855e0ab405adadf2260d9878ffa002dc430b764d4b9daf51b3a7fce8"},"id":"7d32a952855e0ab405adadf2260d9878ffa002dc430b764d4b9daf51b3a7fce8","length":426815488,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"c306aa8d51692f1d93ab2a97affefd2cfe25e3d8af3ffa65cc13ff0303e72c5f"},"id":"c306aa8d51692f1d93ab2a97affefd2cfe25e3d8af3ffa65cc13ff0303e72c5f","length":12738560,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"08281efced21e7969b3f3b1085b1cab51712d69a40e986908777dae6a8d0f5a4"},"size":893,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}],
+    "processes": {
+      "postgres": 3,
+      "web": 2
+    }
+  },
+  {
+    "id": "controller-key",
+    "action": "gen-random",
+    "controller_key": true,
+    "data": "{{ getenv \"CONTROLLER_KEY\" }}"
+  },
+  {
+    "id": "bootstrap-id",
+    "action": "gen-random",
+    "encoding": "uuid"
+  },
+  {
+    "id": "name-seed",
+    "action": "gen-random",
+    "length": 10
+  },
+  {
+    "id": "router-sticky-key",
+    "action": "gen-random",
+    "length": 32,
+    "encoding": "base64"
+  },
+  {
+    "id": "postgres-wait",
+    "action": "wait",
+    "url": "http://postgres-api.discoverd/ping"
+  },
+  {
+    "id": "controller-cert",
+    "action": "gen-tls-cert",
+    "hosts": ["{{ getenv \"CLUSTER_DOMAIN\" }}", "*.{{ getenv \"CLUSTER_DOMAIN\" }}"],
+    "ca_cert": "{{ getenv \"TLS_CA\" }}",
+    "cert": "{{ getenv \"TLS_CERT\" }}",
+    "key": "{{ getenv \"TLS_KEY\" }}"
+  },
+  {
+    "id": "controller",
+    "action": "run-app",
+    "app": {
+      "name": "controller",
+      "meta": {
+        "flynn-system-app": "true",
+        "flynn-system-critical": "true"
+      }
+    },
+    "release": {
+      "env": {
+        "AUTH_KEY": "{{ (index .StepData \"controller-key\").Data }}",
+        "DEFAULT_ROUTE_DOMAIN": "{{ getenv \"CLUSTER_DOMAIN\" }}",
+        "NAME_SEED": "{{ (index .StepData \"name-seed\").Data }}",
+        "CA_CERT": "{{ (index .StepData \"controller-cert\").CACert }}",
+        "TELEMETRY_BOOTSTRAP_ID": "{{ (index .StepData \"bootstrap-id\").Data }}",
+        "TELEMETRY_CLUSTER_ID": "{{ (index .StepData \"bootstrap-id\").Data }}"
+      },
+      "processes": {
+        "web": {
+          "ports": [
+            {"port": 80, "proto": "tcp"},
+            {"port": 8080, "proto": "tcp"}
+          ],
+          "args": ["/bin/start-flynn-controller", "controller"],
+          "service": "controller",
+          "volumes": [{"path": "/tmp", "delete_on_stop": true}]
+        },
+        "scheduler": {
+          "args": ["/bin/start-flynn-controller", "scheduler"],
+          "omni": true,
+          "service": "controller-scheduler",
+          "ports": [{ "proto": "tcp" }]
+        },
+        "worker": {
+          "args": ["/bin/start-flynn-controller", "worker"],
+          "ports": [{ "proto": "tcp" }]
+        }
+      }
+    },
+    "artifacts": [{"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=controller\u0026target=/images/35b4f42db0007452008b76f5f5f81ef50744e116989da2ff4d1d903b7656ae32.json","meta":{"flynn.component":"controller","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/bin/start-flynn-controller"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"965f3e6184ca4339cc1d186b5c5c41619c0bf8e4845a5fb53beb433ed3dcb0cf"},"id":"965f3e6184ca4339cc1d186b5c5c41619c0bf8e4845a5fb53beb433ed3dcb0cf","length":2580480,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"acf85bfb6f68476c4a77aaff734489924cf15d7e522b715e1fc0336a8bdeea12"},"id":"acf85bfb6f68476c4a77aaff734489924cf15d7e522b715e1fc0336a8bdeea12","length":22388736,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"35b4f42db0007452008b76f5f5f81ef50744e116989da2ff4d1d903b7656ae32"},"size":660,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}],
+    "processes": {
+      "web": 1
+    },
+    "resources": [{"name":"postgres", "url":"http://postgres-api.discoverd/databases"}]
+  },
+  {
+    "id": "controller-wait",
+    "action": "wait",
+    "url": "http://controller.discoverd",
+    "status": 401
+  },
+  {
+    "id": "controller-inception",
+    "action": "add-app",
+    "from_step": "controller",
+    "app": {
+      "name": "controller",
+      "meta": {"flynn-system-app": "true"},
+      "strategy": "one-by-one",
+      "deploy_timeout": 120
+    }
+  },
+  {
+    "id": "postgres-app",
+    "action": "add-app",
+    "from_step": "postgres",
+    "app": {
+      "name": "postgres",
+      "meta": {
+        "flynn-system-app": "true",
+        "flynn-system-critical": "true"
+      },
+      "strategy": "sirenia",
+      "deploy_timeout": 120
+    }
+  },
+  {
+    "id": "flannel-app",
+    "action": "add-app",
+    "from_step": "flannel",
+    "app": {
+      "name": "flannel",
+      "meta": {"flynn-system-app": "true"},
+      "strategy": "one-by-one"
+    }
+  },
+  {
+    "id": "discoverd-app",
+    "action": "add-app",
+    "from_step": "discoverd",
+    "app": {
+      "name": "discoverd",
+      "meta": {
+        "flynn-system-app": "true",
+        "flynn-system-critical": "true"
+      },
+      "strategy": "discoverd-meta",
+      "deploy_timeout": 300
+    }
+  },
+  {
+    "id": "scheduler-scale",
+    "action": "scale-app",
+    "app_step": "controller-inception",
+    "processes": {
+      "scheduler": 1,
+      "worker": 2,
+      "web": 2
+    }
+  },
+  {
+    "id": "scheduler",
+    "action": "run-app",
+    "app_step": "controller-inception",
+    "processes": {
+      "scheduler": 1
+    }
+  },
+  {
+    "id": "slugbuilder-24-image",
+    "action": "create-artifact",
+    "artifact": {"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=slugbuilder-24\u0026target=/images/6dc0d62b4efc7f353073efceeb4a74398cbb2ba6dfb3b927ec3bd320c0aa5e0a.json","meta":{"flynn.component":"slugbuilder-24","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/builder/build.sh"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a"},"id":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a","length":166764544,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"4472674c4e9fd809ff5fa5672facebc8f6b95fc86a24389a141c48b39d01d953"},"id":"4472674c4e9fd809ff5fa5672facebc8f6b95fc86a24389a141c48b39d01d953","length":10944512,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"6dc0d62b4efc7f353073efceeb4a74398cbb2ba6dfb3b927ec3bd320c0aa5e0a"},"size":652,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}
+  },
+  {
+    "id": "slugbuilder-14-image",
+    "action": "create-artifact",
+    "artifact": {"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=slugbuilder-14\u0026target=/images/38c76e4e33d97294de6367ddd94d9844b9d9613cc82b80c5d76c46928048541b.json","meta":{"flynn.component":"slugbuilder-14","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/builder/build.sh"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a"},"id":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a","length":166764544,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"05d1ef485ea80b0d0b9cbda8e598357f0fd13d151b95cf76de610c799a00259e"},"id":"05d1ef485ea80b0d0b9cbda8e598357f0fd13d151b95cf76de610c799a00259e","length":10944512,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"38c76e4e33d97294de6367ddd94d9844b9d9613cc82b80c5d76c46928048541b"},"size":652,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}
+  },
+  {
+    "id": "slugrunner-24-image",
+    "action": "create-artifact",
+    "artifact": {"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=slugrunner-24\u0026target=/images/a8a0b2cf209859aa928f26d81d9eb975b54eb56be683e96850220ae9c62b5642.json","meta":{"flynn.component":"slugrunner-24","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/runner/init"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a"},"id":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a","length":166764544,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"0015970082c867a4d1862e4d85ed01d485bfb11b60dcd4b679f8b76ece560ea7"},"id":"0015970082c867a4d1862e4d85ed01d485bfb11b60dcd4b679f8b76ece560ea7","length":4096,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"a8a0b2cf209859aa928f26d81d9eb975b54eb56be683e96850220ae9c62b5642"},"size":643,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}
+  },
+  {
+    "id": "slugrunner-14-image",
+    "action": "create-artifact",
+    "artifact": {"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=slugrunner-14\u0026target=/images/a8a0b2cf209859aa928f26d81d9eb975b54eb56be683e96850220ae9c62b5642.json","meta":{"flynn.component":"slugrunner-14","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/runner/init"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a"},"id":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a","length":166764544,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"0015970082c867a4d1862e4d85ed01d485bfb11b60dcd4b679f8b76ece560ea7"},"id":"0015970082c867a4d1862e4d85ed01d485bfb11b60dcd4b679f8b76ece560ea7","length":4096,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"a8a0b2cf209859aa928f26d81d9eb975b54eb56be683e96850220ae9c62b5642"},"size":643,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}
+  },
+  {
+    "id": "redis-image",
+    "action": "create-artifact",
+    "artifact": {"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=redis\u0026target=/images/a215c6ff9a768f0070831ce56f0868d5cf253adb2f5654c9469400946064d330.json","meta":{"flynn.component":"redis","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/bin/start-flynn-redis"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a"},"id":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a","length":166764544,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"b054324ea68c58d26f9d6530d8b0c116131820dc8247f758ae0c72fe5e93f623"},"id":"b054324ea68c58d26f9d6530d8b0c116131820dc8247f758ae0c72fe5e93f623","length":2535424,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"fb65af1890f44bb2d1b8738261373c029f9b3ab552773e405cb1349013609af4"},"id":"fb65af1890f44bb2d1b8738261373c029f9b3ab552773e405cb1349013609af4","length":12410880,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"a215c6ff9a768f0070831ce56f0868d5cf253adb2f5654c9469400946064d330"},"size":888,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}
+  },
+  {
+    "id": "redis",
+    "app": {
+      "name": "redis",
+      "meta": {"flynn-system-app": "true"}
+    },
+    "action": "deploy-app",
+    "release": {
+      "env": {
+        "FLYNN_REDIS": "redis",
+        "CONTROLLER_KEY": "{{ (index .StepData \"controller-key\").Data }}",
+        "REDIS_IMAGE_ID": "{{ (index .StepData \"redis-image\").ID }}"
+      },
+      "processes": {
+        "web": {
+          "ports": [{"port": 80, "proto": "tcp"}],
+          "args": ["/bin/start-flynn-redis", "api"]
+        }
+      }
+    },
+    "artifacts": [{"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=redis\u0026target=/images/a215c6ff9a768f0070831ce56f0868d5cf253adb2f5654c9469400946064d330.json","meta":{"flynn.component":"redis","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/bin/start-flynn-redis"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a"},"id":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a","length":166764544,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"b054324ea68c58d26f9d6530d8b0c116131820dc8247f758ae0c72fe5e93f623"},"id":"b054324ea68c58d26f9d6530d8b0c116131820dc8247f758ae0c72fe5e93f623","length":2535424,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"fb65af1890f44bb2d1b8738261373c029f9b3ab552773e405cb1349013609af4"},"id":"fb65af1890f44bb2d1b8738261373c029f9b3ab552773e405cb1349013609af4","length":12410880,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"a215c6ff9a768f0070831ce56f0868d5cf253adb2f5654c9469400946064d330"},"size":888,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}],
+    "processes": {
+      "web": 2
+    }
+  },
+  {
+    "id": "add-redis-provider",
+    "action": "add-provider",
+    "name":"redis",
+    "url":"http://redis-api.discoverd/clusters"
+  },
+  {
+    "id": "mariadb-password",
+    "action": "gen-random"
+  },
+  {
+    "id": "mariadb",
+    "app": {
+      "name": "mariadb",
+      "strategy": "sirenia",
+      "meta": {"flynn-system-app": "true"}
+    },
+    "action": "deploy-app",
+    "release": {
+      "env": {
+        "FLYNN_MYSQL": "mariadb",
+        "MYSQL_HOST": "leader.mariadb.discoverd",
+        "MYSQL_DATABASE": "mysql",
+        "MYSQL_USER": "flynn",
+        "MYSQL_PWD": "{{ (index .StepData \"mariadb-password\").Data }}",
+        "SIRENIA_PROCESS": "mariadb",
+        "SINGLETON": "{{ .Singleton }}"
+      },
+      "processes": {
+        "mariadb": {
+          "ports": [{"port": 3306, "proto": "tcp"}],
+          "args": ["/bin/start-flynn-mariadb", "mariadb"],
+          "service": "mariadb",
+          "volumes": [{"path": "/data"}]
+        },
+        "web": {
+          "ports": [{"port": 80, "proto": "tcp"}],
+          "args": ["/bin/start-flynn-mariadb", "api"],
+          "env": {
+            "CONTROLLER_KEY": "{{ (index .StepData \"controller-key\").Data }}"
+          }
+        }
+      }
+    },
+    "artifacts": [{"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=mariadb\u0026target=/images/eacc5196051d8eb5ea0d873353287e8819fceb21c682bc81ed251596ba0235a7.json","meta":{"flynn.component":"mariadb","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/bin/start-flynn-mariadb"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a"},"id":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a","length":166764544,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"080aa6135451fc59f8dc13179b9f26c7ce6c677164e12ff23abead536fafd04d"},"id":"080aa6135451fc59f8dc13179b9f26c7ce6c677164e12ff23abead536fafd04d","length":90558464,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"f4d2a0c6007fef89267af6100e515dd35c2dc1510cd9e8c4b7c37f59d10634e2"},"id":"f4d2a0c6007fef89267af6100e515dd35c2dc1510cd9e8c4b7c37f59d10634e2","length":13099008,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"eacc5196051d8eb5ea0d873353287e8819fceb21c682bc81ed251596ba0235a7"},"size":891,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}],
+    "processes": {
+      "mariadb": 0,
+      "web": 2
+    }
+  },
+  {
+    "id": "add-mysql-provider",
+    "action": "add-provider",
+    "name": "mysql",
+    "url": "http://mariadb-api.discoverd/databases"
+  },
+  {
+    "id": "mongodb-password",
+    "action": "gen-random"
+  },
+  {
+    "id": "mongodb",
+    "app": {
+      "name": "mongodb",
+      "strategy": "sirenia",
+      "meta": {"flynn-system-app": "true"},
+      "deploy_timeout": 240
+    },
+    "action": "deploy-app",
+    "release": {
+      "env": {
+        "FLYNN_MONGO": "mongodb",
+        "MONGO_DATABASE": "admin",
+        "MONGO_HOST": "leader.mongodb.discoverd",
+        "MONGO_USER": "flynn",
+        "MONGO_PWD": "{{ (index .StepData \"mongodb-password\").Data }}",
+        "SIRENIA_PROCESS": "mongodb",
+        "SINGLETON": "{{ .Singleton }}"
+      },
+      "processes": {
+        "mongodb": {
+          "ports": [{"port": 27017, "proto": "tcp"}],
+          "args": ["/bin/start-flynn-mongodb", "mongodb"],
+          "service": "mongodb",
+          "volumes": [{"path": "/data"}]
+        },
+        "web": {
+          "ports": [{"port": 80, "proto": "tcp"}],
+          "args": ["/bin/start-flynn-mongodb", "api"],
+          "env": {
+            "CONTROLLER_KEY": "{{ (index .StepData \"controller-key\").Data }}"
+          }
+        }
+      }
+    },
+    "artifacts": [{"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=mongodb\u0026target=/images/818ed121e1d7a4ddc8295f8b729d928b3f83a715f374af4ce93a908a92fdcff7.json","meta":{"flynn.component":"mongodb","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/bin/start-flynn-mongodb"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a"},"id":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a","length":166764544,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"592eed93930936ad0076c6a37f269ccd530652d7d2a9cedc803518b6bb512baf"},"id":"592eed93930936ad0076c6a37f269ccd530652d7d2a9cedc803518b6bb512baf","length":275128320,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"7a2e9af3f02957be8785c0b9f83e0fc94c9678dbfdde3350d5e27336789bb68e"},"id":"7a2e9af3f02957be8785c0b9f83e0fc94c9678dbfdde3350d5e27336789bb68e","length":16363520,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"818ed121e1d7a4ddc8295f8b729d928b3f83a715f374af4ce93a908a92fdcff7"},"size":892,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}],
+    "processes": {
+      "mongodb": 0,
+      "web": 2
+    }
+  },
+  {
+    "id": "add-mongodb-provider",
+    "action": "add-provider",
+    "name": "mongodb",
+    "url": "http://mongodb-api.discoverd/databases"
+  },
+  {
+    "id": "blobstore",
+    "action": "deploy-app",
+    "app": {
+      "name": "blobstore",
+      "meta": {"flynn-system-app": "true"}
+    },
+    "artifacts": [{"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=blobstore\u0026target=/images/62adffa34b4c1e32b4ff8f5de21ac3237c92016d25d1aae544b581a9315e0c27.json","meta":{"flynn.component":"blobstore","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/bin/flynn-blobstore","server"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a"},"id":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a","length":166764544,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"e465f46c42e2ba7d415ba991d69ca2754480a7240386b12fa60ecff16a1e8f24"},"id":"e465f46c42e2ba7d415ba991d69ca2754480a7240386b12fa60ecff16a1e8f24","length":11988992,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"62adffa34b4c1e32b4ff8f5de21ac3237c92016d25d1aae544b581a9315e0c27"},"size":664,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}],
+    "release": {
+      "processes": {
+        "web": {
+          "ports": [{"port": 80, "proto": "tcp"}],
+          "service": "blobstore"
+        }
+      }
+    },
+    "processes": {
+      "web": 2
+    },
+    "resources": [{"name":"postgres", "url":"http://postgres-api.discoverd/databases"}]
+  },
+  {
+    "id": "router",
+    "action": "deploy-app",
+    "app": {
+      "name": "router",
+      "meta": {"flynn-system-app": "true"}
+    },
+    "artifacts": [{"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=router\u0026target=/images/dfcab6186e0e2a7409dbce60575ae1ea4bbd57f15a6cc12a3ec1b6a00ec99731.json","meta":{"flynn.component":"router","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/bin/flynn-router"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"965f3e6184ca4339cc1d186b5c5c41619c0bf8e4845a5fb53beb433ed3dcb0cf"},"id":"965f3e6184ca4339cc1d186b5c5c41619c0bf8e4845a5fb53beb433ed3dcb0cf","length":2580480,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"7ed348c21e1f790363d5200eae86d24ed8054b0f61618e1d1d8021815a2b46dc"},"id":"7ed348c21e1f790363d5200eae86d24ed8054b0f61618e1d1d8021815a2b46dc","length":6483968,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"dfcab6186e0e2a7409dbce60575ae1ea4bbd57f15a6cc12a3ec1b6a00ec99731"},"size":649,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}],
+    "release": {
+      "env": {
+        "TLSCERT": "{{ (index .StepData \"controller-cert\").Cert }}",
+        "TLSKEY": "{{ (index .StepData \"controller-cert\").PrivateKey }}",
+        "COOKIE_KEY": "{{ (index .StepData \"router-sticky-key\").Data }}",
+        "PROXY_PROTOCOL": "{{ getenv \"PROXY_PROTOCOL\" }}"
+      },
+      "processes": {
+        "app": {
+          "host_network": true,
+          "args": ["/bin/flynn-router", "-http-port", "80", "-https-port", "443", "-tcp-range-start", "3000", "-tcp-range-end", "3500"],
+          "omni": true,
+          "service": "router-api"
+        }
+      }
+    },
+    "processes": {
+      "app": 1
+    }
+  },
+  {
+    "id": "gitreceive",
+    "action": "deploy-app",
+    "app": {
+      "name": "gitreceive",
+      "meta": {"flynn-system-app": "true"}
+    },
+    "artifacts": [{"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=gitreceive\u0026target=/images/67ec9e034aff7baecf3aa1398f324cae4deb7589d4798943613f3b9be65ed5e4.json","meta":{"flynn.component":"gitreceive","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/bin/start-flynn-receiver"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a"},"id":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a","length":166764544,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"6ec13adfe14915ef820174d1875a1d6b667498ef0ba7a7b8beac243880fbf9cd"},"id":"6ec13adfe14915ef820174d1875a1d6b667498ef0ba7a7b8beac243880fbf9cd","length":18669568,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"5c45740a7330fb4b2bb8f249162aae482c6196e1fc57dcca0495d26a51e13711"},"id":"5c45740a7330fb4b2bb8f249162aae482c6196e1fc57dcca0495d26a51e13711","length":14614528,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"67ec9e034aff7baecf3aa1398f324cae4deb7589d4798943613f3b9be65ed5e4"},"size":892,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}],
+    "release": {
+      "env": {
+        "CONTROLLER_KEY": "{{ (index .StepData \"controller-key\").Data }}",
+        "SLUGBUILDER_24_IMAGE_ID": "{{ (index .StepData \"slugbuilder-24-image\").ID }}",
+        "SLUGBUILDER_14_IMAGE_ID": "{{ (index .StepData \"slugbuilder-14-image\").ID }}",
+        "SLUGRUNNER_24_IMAGE_ID": "{{ (index .StepData \"slugrunner-24-image\").ID }}",
+        "SLUGRUNNER_14_IMAGE_ID": "{{ (index .StepData \"slugrunner-14-image\").ID }}"
+      },
+      "processes": {
+        "app": {
+          "ports": [
+            {
+              "proto": "tcp",
+              "service": {
+                "name": "gitreceive",
+                "create": true,
+                "check": {"type": "tcp"}
+              }
+            }
+          ],
+          "service": "gitreceive",
+          "volumes": [{"path": "/tmp", "delete_on_stop": true}]
+        }
+      }
+    },
+    "processes": {
+      "app": 2
+    }
+  },
+  {
+    "id": "tarreceive",
+    "action": "deploy-app",
+    "app": {
+      "name": "tarreceive",
+      "meta": {"flynn-system-app": "true"}
+    },
+    "artifacts": [{"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=tarreceive\u0026target=/images/c3b8bbfadeadbd61b3280bb690afd8f7b39b1fbe3e3d5ab0af49da1078eb4116.json","meta":{"flynn.component":"tarreceive","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/bin/tarreceive"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a"},"id":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a","length":166764544,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"ae80cfb3cdfd4621faa8860986ed0244fd1f443db9d68e833acb084e3baa5e56"},"id":"ae80cfb3cdfd4621faa8860986ed0244fd1f443db9d68e833acb084e3baa5e56","length":9162752,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"c3b8bbfadeadbd61b3280bb690afd8f7b39b1fbe3e3d5ab0af49da1078eb4116"},"size":649,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}],
+    "release": {
+      "env": {
+        "AUTH_KEY": "{{ (index .StepData \"controller-key\").Data }}",
+        "CONTROLLER_KEY": "{{ (index .StepData \"controller-key\").Data }}"
+      },
+      "processes": {
+        "app": {
+          "ports": [
+            {
+              "port": 80,
+              "proto": "tcp",
+              "service": {
+                "name": "tarreceive",
+                "create": true,
+                "check": {"type": "http", "path": "/.well-known/status"}
+              }
+            }
+          ],
+          "linux_capabilities": [
+            "CAP_NET_RAW",
+            "CAP_NET_BIND_SERVICE",
+            "CAP_DAC_OVERRIDE",
+            "CAP_SETFCAP",
+            "CAP_SETPCAP",
+            "CAP_SETGID",
+            "CAP_SETUID",
+            "CAP_MKNOD",
+            "CAP_CHOWN",
+            "CAP_FOWNER",
+            "CAP_FSETID",
+            "CAP_KILL",
+            "CAP_SYS_CHROOT",
+            "CAP_SYS_ADMIN"
+          ],
+          "volumes": [{"path": "/tmp", "delete_on_stop": true}]
+        }
+      }
+    },
+    "processes": {
+      "app": 2
+    }
+  },
+  {
+    "id": "router-wait",
+    "action": "wait",
+    "url": "http://router-api.discoverd",
+    "status": 404
+  },
+  {
+    "id": "gitreceive-route",
+    "action": "add-route",
+    "app_step": "gitreceive",
+    "cert_step": "controller-cert",
+    "type": "http",
+    "service": "gitreceive",
+    "domain": "git.{{ getenv \"CLUSTER_DOMAIN\" }}",
+    "drain_backends": true
+  },
+  {
+    "id": "tarreceive-route",
+    "action": "add-route",
+    "app_step": "tarreceive",
+    "cert_step": "controller-cert",
+    "type": "http",
+    "service": "tarreceive",
+    "domain": "images.{{ getenv \"CLUSTER_DOMAIN\" }}",
+    "drain_backends": true
+  },
+  {
+    "id": "controller-route",
+    "action": "add-route",
+    "app_step": "controller-inception",
+    "cert_step": "controller-cert",
+    "type": "http",
+    "service": "controller",
+    "domain": "controller.{{ getenv \"CLUSTER_DOMAIN\" }}",
+    "drain_backends": false
+  },
+  {
+    "id": "controller-route-wait",
+    "action": "wait",
+    "url": "http://router-http.discoverd",
+    "host": "controller.{{ getenv \"CLUSTER_DOMAIN\" }}",
+    "status": 401
+  },
+  {
+    "id": "logaggregator",
+    "action": "deploy-app",
+    "app": {
+      "name": "logaggregator",
+      "meta": {"flynn-system-app": "true"}
+    },
+    "artifacts": [{"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=logaggregator\u0026target=/images/dfdcac62037862d6e5392e5126f29d3283ee5ae47e6a4beb79394dd6d58cf6d5.json","meta":{"flynn.component":"logaggregator","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/bin/logaggregator"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"965f3e6184ca4339cc1d186b5c5c41619c0bf8e4845a5fb53beb433ed3dcb0cf"},"id":"965f3e6184ca4339cc1d186b5c5c41619c0bf8e4845a5fb53beb433ed3dcb0cf","length":2580480,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"b19249a222ba29dc39882046592ada5d22a03971b48664455c4ca4f6579e40c3"},"id":"b19249a222ba29dc39882046592ada5d22a03971b48664455c4ca4f6579e40c3","length":5677056,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"dfdcac62037862d6e5392e5126f29d3283ee5ae47e6a4beb79394dd6d58cf6d5"},"size":650,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}],
+    "release": {
+      "processes": {
+        "app": {
+          "args": ["/bin/logaggregator"],
+          "ports": [
+            {"port": 80, "proto": "tcp"},
+            {"port": 514, "proto": "tcp"}
+          ]
+        }
+      }
+    },
+    "processes": {
+      "app": 2
+    }
+  },
+  {
+    "id": "taffy",
+    "action": "deploy-app",
+    "app": {
+      "name": "taffy",
+      "meta": {"flynn-system-app": "true"}
+    },
+    "artifacts": [{"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=taffy\u0026target=/images/472075809af4f14f3a633e2c31aa853e4f0a86f30adb9173f9f27d3a0e28fc89.json","meta":{"flynn.component":"taffy","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/bin/taffy"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a"},"id":"bc754e017aee8901d3545a0058aef366a55938f76cc03e302c83434118cb0f4a","length":166764544,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"1d9f164622f1410d4c6fe7511e1e093d5ed2b2c6d3ac593e19a43819a8f5a2f2"},"id":"1d9f164622f1410d4c6fe7511e1e093d5ed2b2c6d3ac593e19a43819a8f5a2f2","length":18669568,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"865194be30531806711c654567be391798fdff4600fceb58420f431c278d1eae"},"id":"865194be30531806711c654567be391798fdff4600fceb58420f431c278d1eae","length":7442432,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"472075809af4f14f3a633e2c31aa853e4f0a86f30adb9173f9f27d3a0e28fc89"},"size":876,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}],
+    "release": {
+      "env": {
+        "CONTROLLER_KEY": "{{ (index .StepData \"controller-key\").Data }}",
+        "SLUGBUILDER_24_IMAGE_ID": "{{ (index .StepData \"slugbuilder-24-image\").ID }}",
+        "SLUGBUILDER_14_IMAGE_ID": "{{ (index .StepData \"slugbuilder-14-image\").ID }}",
+        "SLUGRUNNER_24_IMAGE_ID": "{{ (index .StepData \"slugrunner-24-image\").ID }}",
+        "SLUGRUNNER_14_IMAGE_ID": "{{ (index .StepData \"slugrunner-14-image\").ID }}"
+      }
+    }
+  },
+  {
+    "id": "status-key",
+    "action": "gen-random",
+    "data": "{{ getenv \"STATUS_KEY\" }}"
+  },
+  {
+    "id": "status",
+    "action": "deploy-app",
+    "app": {
+      "name": "status",
+      "meta": {"flynn-system-app": "true"}
+    },
+    "artifacts": [{"type":"flynn","uri":"https://consolving.github.io/flynn-tuf-repo/repository?name=status\u0026target=/images/a9fb8490646b7b868ee76c9d26bf237e953f6cdc57d20898d2260a940e6a98c6.json","meta":{"flynn.component":"status","flynn.system-image":"true"},"manifest":{"_type":"application/vnd.flynn.image.manifest.v1+json","entrypoints":{"_default":{"args":["/bin/flynn-status"]}},"rootfs":[{"layers":[{"hashes":{"sha512_256":"965f3e6184ca4339cc1d186b5c5c41619c0bf8e4845a5fb53beb433ed3dcb0cf"},"id":"965f3e6184ca4339cc1d186b5c5c41619c0bf8e4845a5fb53beb433ed3dcb0cf","length":2580480,"type":"application/vnd.flynn.image.squashfs.v1"},{"hashes":{"sha512_256":"ad9ea44f93d90e396b19e6b951ed28dbc3857a8eddb2c49b52683dc1ce60c6fa"},"id":"ad9ea44f93d90e396b19e6b951ed28dbc3857a8eddb2c49b52683dc1ce60c6fa","length":5390336,"type":"application/vnd.flynn.image.squashfs.v1"}],"platform":{"architecture":"amd64","os":"linux"}}]},"hashes":{"sha512_256":"a9fb8490646b7b868ee76c9d26bf237e953f6cdc57d20898d2260a940e6a98c6"},"size":649,"layer_url_template":"https://dl.consolving.net/{id}.squashfs"}],
+    "release": {
+      "env": {
+        "AUTH_KEY": "{{ (index .StepData \"status-key\").Data }}"
+      },
+      "processes": {
+        "web": {
+          "ports": [{
+            "port": 80,
+            "proto": "tcp",
+            "service": {
+              "name": "status-web",
+              "create": true,
+              "check": {"type": "tcp"}
+            }
+          }]
+        }
+      }
+    },
+    "processes": {
+      "web": 2
+    }
+  },
+  {
+    "id": "status-route",
+    "action": "add-route",
+    "app_step": "status",
+    "type": "http",
+    "service": "status-web",
+    "domain": "status.{{ getenv \"CLUSTER_DOMAIN\" }}",
+    "drain_backends": true
+  },
+  {
+    "id": "redis-wait",
+    "action": "wait",
+    "url": "http://redis-api.discoverd/ping"
+  },
+  {
+    "id": "mariadb-wait",
+    "action": "wait",
+    "url": "http://mariadb-api.discoverd",
+    "status": 404
+  },
+  {
+    "id": "mongodb-wait",
+    "action": "wait",
+    "url": "http://mongodb-api.discoverd",
+    "status": 404
+  },
+  {
+    "id": "blobstore-wait",
+    "action": "wait",
+    "url": "http://blobstore.discoverd",
+    "status": 200
+  },
+  {
+    "id": "gitreceive-wait",
+    "action": "wait",
+    "url": "tcp://gitreceive.discoverd"
+  },
+  {
+    "id": "tarreceive-wait",
+    "action": "wait",
+    "url": "http://tarreceive.discoverd/.well-known/status"
+  },
+  {
+    "id": "status-check",
+    "action": "status-check",
+    "url": "http://status-web.discoverd"
+  },
+  {
+    "id": "cluster-monitor",
+    "action": "cluster-monitor",
+    "enabled": true
+  },
+  {
+    "id": "log-complete",
+    "action": "log",
+    "output": "\n\nFlynn bootstrapping complete. Install the Flynn CLI (see https://flynn.io/docs/cli for instructions) and paste the line below into a terminal window:\n\nflynn cluster add -p {{ (index .StepData \"controller-cert\").Pin }} default {{ getenv \"CLUSTER_DOMAIN\" }} {{ (index .StepData \"controller-key\").Data }}"
+  }
+]

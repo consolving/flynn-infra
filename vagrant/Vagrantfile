@@ -84,13 +84,21 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
       node.vm.network :private_network,
         ip: node_ip,
         libvirt__network_name: "flynn-cluster",
-        libvirt__dhcp_enabled: false
+        libvirt__dhcp_enabled: false,
+        libvirt__mac: "52:54:00:FD:00:%02X" % i
 
       # libvirt provider settings
       node.vm.provider :libvirt do |libvirt|
         libvirt.driver = "kvm"
         libvirt.memory = NODE_MEMORY
         libvirt.cpus   = NODE_CPUS
+
+        # Pass through the host CPU's actual feature set (AVX, etc.) instead
+        # of the generic default QEMU CPU model. MongoDB 5.0+ requires AVX
+        # and will crash with SIGILL ("illegal instruction") on the default
+        # model, which does not expose it to the guest even when the host
+        # CPU supports it.
+        libvirt.cpu_mode = "host-passthrough"
 
         # Assign a deterministic MAC on the management network so each VM
         # gets a unique DHCP lease.  Without this, vagrant-libvirt can hand
@@ -125,6 +133,17 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
       end
       node.vm.provision "system", type: "shell", privileged: true, path: "provision.sh", args: provision_args
 
+      # Upload the bootstrap manifest used by the final bootstrap step.
+      # This file is generated alongside the TUF release; keep it in the Vagrant
+      # directory so the bootstrap step can find it without relying on the
+      # manifest being published as a separate TUF target.
+      node.vm.provision "manifest-file", type: "file",
+        source: "bootstrap-manifest.json",
+        destination: "/tmp/vagrant-bootstrap-manifest.json"
+
+      node.vm.provision "manifest-install", type: "shell", privileged: true,
+        inline: "mkdir -p /etc/flynn && cp /tmp/vagrant-bootstrap-manifest.json /etc/flynn/bootstrap-manifest.json"
+
       # Phase 2: Bootstrap (last node only, after all nodes are up)
       # We run bootstrap on the LAST node so that all previous nodes'
       # daemons are already running when bootstrap's check-online-hosts runs.
@@ -150,10 +169,11 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
 
           echo "==> All #{NUM_NODES} peers are online. Running bootstrap..."
           CLUSTER_DOMAIN="#{CLUSTER_DOMAIN}" \\
-          flynn-host bootstrap \\
+          flynn-host bootstrap /etc/flynn/bootstrap-manifest.json \\
             --min-hosts=#{NUM_NODES} \\
             --peer-ips=#{NODE_IPS.join(",")} \\
             --timeout=600 \\
+            --job-timeout=600 \\
             2>&1 | tee /var/log/flynn/bootstrap.log
 
           echo "==> Bootstrap complete!"

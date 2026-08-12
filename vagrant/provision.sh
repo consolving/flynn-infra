@@ -96,6 +96,13 @@ verify_cgroups() {
 install_packages() {
 	info "Updating package lists..."
 
+	# Force IPv4 for apt/curl — this NAT'd lab network has no IPv6 route,
+	# and Ubuntu's default resolver order can return AAAA records first,
+	# causing "Network is unreachable" failures on archive.ubuntu.com etc.
+	if [[ ! -f /etc/apt/apt.conf.d/99force-ipv4 ]]; then
+		echo 'Acquire::ForceIPv4 "true";' >/etc/apt/apt.conf.d/99force-ipv4
+	fi
+
 	# Ensure universe repo is enabled (ZFS is in universe on Ubuntu)
 	if ! apt-cache policy 2>/dev/null | grep -q "universe"; then
 		info "Enabling universe repository..."
@@ -234,21 +241,21 @@ setup_networking() {
 		rm -f /etc/netplan/50-vagrant*.yaml 2>/dev/null || true
 	fi
 
-	# Find the private network interface: second non-loopback interface
+	# Find the private cluster interface by deterministic MAC OUI
 	local priv_iface=""
 	for iface in $(ls /sys/class/net/ | grep -v lo | sort); do
-		if ip route show default | grep -q "dev ${iface}"; then
-			continue
-		fi
-		if [[ -d "/sys/class/net/${iface}" ]] && ip link show "${iface}" | grep -q "state UP"; then
-			priv_iface="${iface}"
-			break
+		if [[ -d "/sys/class/net/${iface}" ]]; then
+			local mac
+			mac=$(cat "/sys/class/net/${iface}/address")
+			if [[ "$mac" =~ ^52:54:00:[Ff][Dd]: ]]; then
+				priv_iface="${iface}"
+				break
+			fi
 		fi
 	done
 
 	if [[ -z "$priv_iface" ]]; then
-		warn "Could not auto-detect private network interface, trying ens7..."
-		priv_iface="ens7"
+		fail "Could not find Flynn private interface (expected MAC OUI 52:54:00:FD)"
 	fi
 
 	# Remove all conflicting networkd configs for this interface and write
@@ -267,13 +274,42 @@ setup_networking() {
 	info "Assigning ${NODE_IP}/24 to ${priv_iface}..."
 	ip addr flush dev "${priv_iface}" 2>/dev/null || true
 	ip addr add "${NODE_IP}/24" dev "${priv_iface}" 2>/dev/null || true
-	systemctl restart systemd-networkd 2>/dev/null || true
+	systemctl reload systemd-networkd 2>/dev/null || true
 
 	# Verify
 	if ip addr show "${priv_iface}" | grep -q "inet ${NODE_IP}/"; then
 		info "IP ${NODE_IP} assigned to ${priv_iface} OK"
 	else
 		fail "Failed to assign ${NODE_IP} to ${priv_iface}"
+	fi
+
+	# Fix asymmetric routing for externally-DNAT'd traffic (e.g. a reverse
+	# proxy on the hypervisor forwarding 80/443 to this node's data IP).
+	# The default route goes out the *management* NIC, so without this,
+	# replies to traffic that arrived on the *data* NIC leave via the wrong
+	# interface/network and never reach the original external client.
+	if ! ip rule show | grep -q "from ${NODE_IP} lookup 50"; then
+		info "Adding policy route: replies to ${NODE_IP} go out ${priv_iface}"
+		ip rule add from "${NODE_IP}" lookup 50 priority 100
+		ip route add default via "${PRIVATE_SUBNET_GW:-${NODE_IP%.*}.1}" dev "${priv_iface}" table 50
+		cat > /etc/systemd/system/flynn-data-route.service <<-UNITEOF
+		[Unit]
+		Description=Route replies to the data-network IP via the data NIC (fixes asymmetric routing for external access)
+		After=network-online.target
+		Wants=network-online.target
+
+		[Service]
+		Type=oneshot
+		RemainAfterExit=yes
+		ExecStart=/sbin/ip rule add from ${NODE_IP} lookup 50 priority 100
+		ExecStart=/sbin/ip route add default via ${PRIVATE_SUBNET_GW:-${NODE_IP%.*}.1} dev ${priv_iface} table 50
+		ExecStop=/sbin/ip rule del from ${NODE_IP} lookup 50 priority 100
+
+		[Install]
+		WantedBy=multi-user.target
+		UNITEOF
+		systemctl daemon-reload
+		systemctl enable flynn-data-route.service
 	fi
 
 	# Fix DNS resolution for containers: Ubuntu Noble's /etc/resolv.conf may be

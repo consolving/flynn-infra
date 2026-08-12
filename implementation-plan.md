@@ -1004,3 +1004,164 @@ Successfully ran integration tests against the live single-node Vagrant cluster 
 
 **Known issue — stale `dl.consolving.net/flynn-host.gz`**:
 - `dl.consolving.net/flynn-host.gz` still serves the OLD v20260518.0 binary (sha512 `cdf715ab...`) while targets.json points `/flynn-host.gz` → `1a59d249...` (v20260527.0). Provision works anyway (binary only used for the download step; TUF-installed components + bootstrap verified), but the IPFS pin behind dl.consolving.net should be re-synced so the "current" flynn-host.gz matches metadata.
+
+### Full 5-Node Cluster Deployment — Root-Cause Fixes and Working Deployment (2026-08-11/12)
+
+**Goal**: Get a genuinely working, externally-reachable 5-node Flynn cluster on the dev-machine that a human can log into and test manually. Found and fixed five independent, unrelated bugs along the way — each one masked the next until fixed.
+
+#### Bug 1: `vagrant-libvirt` management network dnsmasq silently dies
+
+The libvirt `vagrant-libvirt` NAT network's dnsmasq process can die (stale PID, no restart) without the network itself showing as inactive in `virsh net-list`. VMs then get no DHCP lease and Vagrant's SSH step hangs/fails with "Host unreachable. Retrying...".
+
+**Fix**: `virsh net-destroy vagrant-libvirt && virsh net-start vagrant-libvirt` (or redefine from a saved XML if the network object itself got removed — see Bug 5). No permanent code fix; this is host hygiene. Recreated `/tmp/vagrant-libvirt.xml` as a saved copy of the network definition for quick recovery:
+```xml
+<network connections='1' ipv6='yes'>
+  <name>vagrant-libvirt</name>
+  <uuid>14ca382f-7f02-4a17-8527-8391ebaa6432</uuid>
+  <forward mode='nat'><nat><port start='1024' end='65535'/></nat></forward>
+  <bridge name='virbr1' stp='on' delay='0'/>
+  <mac address='52:54:00:2b:8f:c0'/>
+  <ip address='192.168.121.1' netmask='255.255.255.0'>
+    <dhcp><range start='192.168.121.1' end='192.168.121.254'/></dhcp>
+  </ip>
+</network>
+```
+
+**Related**: `vagrant destroy` on the last VM using a manually-`virsh net-define`'d network sometimes tears the network down too (inconsistent — happened ~50% of the time across many destroy/recreate cycles in this session). Always check `virsh net-list --all` after any `vagrant destroy` and redefine+start `vagrant-libvirt` if missing, before the next `vagrant up`/`cluster-up.sh`.
+
+#### Bug 2: `flynn-host` binaries built with `"dev"` version string, infinite download loop
+
+**Symptom**: `flynn-host download` never terminates — repeatedly downloads binaries, execs into itself, loops forever. Root cause: `script/bootstrap-build` defaults to `--version dev` when the flag isn't passed explicitly. Whoever built the v20260811.0 release ran it without `--version v20260811.0`, so `flynn-host`/`flynn-init`/`flynn-linux-amd64` all embedded `version.version = "dev"` via the ldflags in `builder/go-wrapper.sh`. In `host/cli/download.go`:
+```go
+if version.Release() != requestedVersion {
+    // re-exec into the just-downloaded binary — but since it's ALSO "dev", loops forever
+    return syscall.Exec(binPath, argv, os.Environ())
+}
+```
+
+**Fix**: rebuilt the three binaries with `script/bootstrap-build --version v20260811.0`, then hand-patched the existing v20260811.0 TUF release (same version tag, corrected binary content) rather than cutting a new release:
+1. Wrote `flynn-tuf-repo/script/fix-binary-versions.py` — mirrors the existing `update-release-artifacts.py`/`update-postgres-layer.py` pattern (canonical-JSON ed25519 signing via PyNaCl), replacing just the `/flynn-host.gz`, `/flynn-linux-amd64.gz`, `/v20260811.0/{flynn-host,flynn-init,flynn-linux-amd64}.gz` targets and bumping targets/snapshot/timestamp versions.
+2. **Important discovery**: `/go/bin/tuf` (the standard go-tuf CLI) is built from `github.com/theupdateframework/go-tuf@v0.7.0`, a **different fork** than the one this repo's `root.json` was signed with (`github.com/flynn/go-tuf`, older key-ID algorithm — canonical JSON of just `{keytype, keyval}` vs. the newer fork's `{keytype, scheme, keyid_hash_algorithms, keyval}`). Using the newer CLI to sign gives "no keys available" even with the *correct* private key, because the computed key ID doesn't match root.json's registered key ID. Don't reach for `/go/bin/tuf` for this repo — always use the Python signer pattern.
+3. Verified against the live mirror before/after: `flynn-host download --repository https://tuf.consolving.net/repository` completed cleanly, `flynn-host version` reports `v20260811.0`.
+4. Pushed `flynn-tuf-repo` commit `29c6006`, bumped `flynn-dev` submodule pointer.
+
+#### Bug 3: `cluster-up.sh` clones never got a unique `--id`/`host_id`
+
+**Symptom**: only ONE of 5 nodes' `flynn-router` (host-networked, omni) actually listens on 80/443; the other 4 report `flynn-host ps` job entries that look "running" (PID, full config) but have **zero** log output ever, and the host-level PID doesn't exist. Root cause: `cluster-up.sh`'s clone customization only `sed`s `--external-ip=` in the cloned `flynn-host.service`, never `--id=` or `--tags=host_id=`. All 5 clones ran with the **same** `flynn-host daemon --id=node1 ...`, colliding in discoverd/raft-based host tracking — jobs "assigned" to `node1` land on whichever physical host most recently won that identity race, and get silently dropped on the others.
+
+**Fix** (`cluster-up.sh`):
+```bash
+echo "$SVC_TEMPLATE" \
+    | sed -e "s/--external-ip=[0-9.]*/--external-ip=${target_ip}/" \
+          -e "s/--id=node1/--id=node${i}/" \
+          -e "s/--tags=host_id=node1/--tags=host_id=node${i}/" \
+    > "${WORK_DIR}/flynn-host-node${i}.service"
+```
+After this fix, `flynn-host.service --id=` is unique per node (`node1`..`node5`), and port 80/443 is reachable on **all 5** nodes.
+
+#### Bug 4: mongodb image ships with no `mongod` binary
+
+**Symptom**: `flynn -a mongodb ps` shows the process crash-looping; `flynn-host log` shows `fork/exec /usr/bin/mongod: no such file or directory`. Root cause: `flynn/appliance/mongodb/img/packages.sh` referenced the MongoDB **7.0** apt repo for Ubuntu **noble** (24.04) — `repo.mongodb.org/apt/ubuntu/dists/noble/mongodb-org/7.0/` doesn't exist; MongoDB dropped 7.0 support for 24.04. Without `set -e`, `apt-get install mongodb-org` failed silently and the script exited 0, so `export-tuf` happily packaged an image containing only `curl` (from the repo-setup step) and the flynn wrapper binaries.
+
+**Fix** (`appliance/mongodb/img/packages.sh`):
+- Use `noble/mongodb-org/8.0` (first release line with noble packages).
+- `curl ... | gpg --dearmor -o ...` instead of writing the ASCII-armored `.asc` directly — `apt`'s `signed-by=` needs a binary keyring, not ASCII-armor (a second silent-failure trap; caused a GPG "NO_PUBKEY" error on the first re-export attempt).
+- Added `set -eo pipefail` and a `test -x /usr/bin/mongod || exit 1` fail-fast check at the end.
+- Re-ran `export-tuf` with the persistent `/var/lib/flynn/layer-cache` (903MB, content-addressed) — cache hits for all unrelated images, mongodb rebuilt from scratch (166MB layer now, up from ~2MB).
+- Pushed `flynn-tuf-repo` commit `a5d7d88`.
+
+**Discovered a second, unrelated export-tuf bug while re-syncing**: `export-tuf` writes new/changed **binary** targets (`.gz` files under `v{version}/`) into the git-tracked `repository/` tree, but does **not** write package/base **layer** squashfs files into `repository/targets/layers/` at all — it assumes they're already distributed via IPFS from a prior release and only relies on the (gitignored) local `layer-cache` for hash computation. This is fine for layers that genuinely haven't changed, but for a release where package content **did** change (mongodb, and — due to non-reproducible `apt-get install` builds — several other images too), the new squashfs files exist only in `/var/lib/flynn/layer-cache/{hash}.squashfs`, not in the repo, and never get IPFS-synced by the normal commit+release-and-sync.sh flow. Cross-checked every layer hash referenced by the newly-generated `bootstrap-manifest.json` against `dl.consolving.net` and manually copied+synced the ones missing (22 layers, ~1.1GB, sourced directly from `layer-cache`).
+
+**Also discovered**: `dl.consolving.net`'s Traefik `addprefix` is `/ipfs/{CID}/repository/targets` (flat) — it can **only** reach files stored directly under `repository/targets/{hash}.ext`, never anything nested under a nested subdirectory. `export-tuf`'s own `layerURLTpl` is `https://dl.consolving.net/{id}.squashfs` (flat, confirmed in `script/export-tuf/main.go`), so **all** squashfs layers must be synced flat, not under a `layers/` subdirectory — nesting them under `layers/` (my first attempt) leaves them reachable via `tuf.consolving.net/repository/targets/layers/{hash}.squashfs` but 404 via `dl.consolving.net/{hash}.squashfs`, which is what `flynn-host` actually requests for image layers.
+
+**Manual recovery process for a missing target, if this happens again**:
+```bash
+# 1. Find which layer hashes bootstrap actually needs:
+python3 -c "
+import json
+d = json.load(open('bootstrap-manifest.json'))
+hashes=set()
+for step in d:
+    for art in step.get('artifacts', []):
+        for rfs in art.get('manifest',{}).get('rootfs', []):
+            for l in rfs.get('layers', []): hashes.add(l['id'])
+print('\n'.join(sorted(hashes)))
+" > /tmp/needed-hashes.txt
+
+# 2. Check which are missing from the live mirror:
+while read h; do
+  code=$(curl -sf -o /dev/null -w '%{http_code}' https://dl.consolving.net/${h}.squashfs)
+  [ "$code" != "200" ] && echo "MISSING: $h"
+done < /tmp/needed-hashes.txt
+
+# 3. Copy missing ones FLAT (no subdirectory!) from /var/lib/flynn/layer-cache
+#    into a sync source dir, then:
+ssh host1.consolving.net /opt/flynn-tuf-dl/release-and-sync.sh /path/to/sync-src
+```
+
+#### Bug 5: MongoDB 5.0+ requires AVX; default QEMU CPU model doesn't expose it
+
+**Symptom**: even after fixing Bug 4, `mongod` started but immediately crashed with `signal: illegal instruction (core dumped)`. The dev-machine's physical CPU has AVX (`grep -c avx /proc/cpuinfo` → 40), but neither the Vagrantfile nor `cluster-up.sh`'s raw libvirt XML template set a CPU mode, so vagrant-libvirt/libvirt defaulted to a generic `qemu64` model with no AVX exposed to the guest (`grep -c avx /proc/cpuinfo` inside the VM → 0).
+
+**Fix**:
+- `vagrant/Vagrantfile`: added `libvirt.cpu_mode = "host-passthrough"` to the provider block.
+- `vagrant/cluster-up.sh`: added `<cpu mode='host-passthrough'/>` to the clone domain XML template (this was previously **completely absent** — no `<cpu>` element at all).
+- Applied live to a running cluster via `virsh destroy <vm> && virsh dumpxml <vm> | sed <replace cpu block> > fixed.xml && virsh define fixed.xml && virsh start <vm>` (no full VM rebuild needed — libvirt domain state persists across a CPU-model change).
+- Verified: cluster survived a simultaneous reboot of 4/5 nodes (to apply the CPU fix) and recovered to fully healthy within ~90s.
+
+#### Non-bug: `mariadb`/`mongodb` need manual `SINGLETON=true` for a scale-1 deployment in a 5-node cluster
+
+This is **expected behavior**, not a bug. `bootstrap/manifest_template.json` correctly templates `SINGLETON: "{{ .Singleton }}"` for postgres, mariadb, and mongodb alike — the value is based on **total cluster node count** (5 → `false`, expecting real multi-node replica-set/quorum operation), not on how many instances of that specific app you scale up. The bootstrap manifest deliberately scales `mariadb`/`mongodb` engine processes to `0` (only the `web` API layer runs by default) to save resources; scaling to `1` manually leaves `SINGLETON=false`, so the lone instance waits forever for a quorum that will never form. Fix is a one-time manual step per app after bootstrap:
+```bash
+flynn -a mariadb scale mariadb=0 && flynn -a mongodb scale mongodb=0
+flynn -a mariadb env set SINGLETON=true
+flynn -a mongodb env set SINGLETON=true
+flynn -a mariadb scale mariadb=1 && flynn -a mongodb scale mongodb=1
+```
+(`env set` on a Sirenia app fails with "missing sirenia cluster state" while an unassigned peer is stuck at scale=1 — scale to 0 first, set env, then scale back up.)
+
+#### Bug 6: asymmetric routing breaks external access to the cluster
+
+**Symptom**: DNAT'ing dev-machine `192.168.168.87:80/443` → a node's data-network IP (e.g. `192.168.50.11:80`) reaches the node (confirmed via tcpdump on the node's `ens7`), but the node never replies — external client sees connection timeout. Root cause: every cluster node's **default route** goes out the *management* NIC (`ens6`, DHCP via `vagrant-libvirt`/`virbr1`), not the *data* NIC (`ens7`, static IP on `flynn-cluster`/`virbr2`) where the DNAT'd traffic actually arrives. The reply to an externally-sourced SYN gets routed via the wrong gateway/network entirely and never makes it back.
+
+**Fix**: source-based policy routing on each node, so replies to the node's own data IP go out the data NIC:
+```bash
+ip rule add from <node-data-ip> lookup 50 priority 100
+ip route add default via <data-subnet>.1 dev <data-iface> table 50
+```
+Made permanent via `provision.sh` (added right after the interface/IP assignment step) — writes a `flynn-data-route.service` systemd oneshot unit and enables it, so future redeploys get this automatically on every node regardless of which one ends up being the external access point.
+
+**Also required**: the DNAT rule itself must be scoped to the dev-machine's own external IP (`-d 192.168.168.87`), **not** a blanket `-p tcp --dport 80/443` with no destination filter — an unscoped rule hijacks *all* transiting traffic on those ports, including the VMs' own outbound apt/HTTP traffic (broke `archive.ubuntu.com:80` mid-session and cost significant time misdiagnosing it as an unrelated network flake before finding the real cause in `iptables -t nat -L PREROUTING`).
+
+Persisted via `iptables-save > /etc/iptables/rules.v4` (loaded by `/etc/network/if-pre-up.d/iptables` on this Debian 13 host).
+
+#### End state (2026-08-12)
+
+5-node cluster (`vagrant_node1` + `flynn_node2..5`), all `flynn-host` daemons unique-ID'd and healthy, full service status **all green**:
+```json
+{"status":"healthy","detail":{
+  "blobstore":"healthy","controller":"healthy","controller-scheduler":"healthy",
+  "controller-worker":"healthy","discoverd":"healthy","flannel":"healthy",
+  "gitreceive":"healthy","logaggregator":"healthy","mariadb":"healthy",
+  "mongodb":"healthy","postgres":"healthy","router":"healthy","tarreceive":"healthy"
+}, "version":"v20260811.0"}
+```
+
+**External access, for manual testing**:
+- Add to local `/etc/hosts` (no wildcard support, list what you need):
+  ```
+  192.168.168.87  demo.localflynn.com
+  192.168.168.87  controller.demo.localflynn.com
+  192.168.168.87  status.demo.localflynn.com
+  192.168.168.87  git.demo.localflynn.com
+  ```
+- `curl http://status.demo.localflynn.com` → cluster health JSON.
+- `curl -k https://controller.demo.localflynn.com` → `401` (needs auth token — cluster reachable and routing correctly).
+- No `dashboard.*` app is deployed by this manifest (Flynn's own web dashboard isn't part of the minimal bootstrap set used here — only `status`, `controller`, `router`, etc.).
+- `.flynnrc` cluster-add command is printed at the end of every `cluster-up.sh` run; also recoverable via `grep 'flynn cluster add' <cluster-up.sh log>`.
+
+**Known remaining gaps** (not addressed this session, lower priority):
+- Only node1 has the DNAT-facing policy route actively used; other 4 nodes have the fix available via `provision.sh` but it's inert unless that node becomes the DNAT target.
+- `cluster-up.sh`'s "management network sometimes disappears on `vagrant destroy`" (Bug 1) has no permanent fix — still requires manual `virsh net-define`+`net-start` recovery before some redeploys.
+- The broader `export-tuf` layer-sync gap (Bug 4's second finding) is a latent footgun for any future release with changed package content — worth a proper fix in `export-tuf/main.go` (write ALL layers, changed or not, to `repository/targets/{hash}.squashfs` flat, every run) rather than relying on layer-cache + "assume IPFS already has it".
+

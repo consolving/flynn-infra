@@ -45,6 +45,7 @@ ssh -i ~/.ssh/id_ed25519 root@192.168.168.87
 
 - **AppArmor**: libvirt security driver set to `"none"` in `/etc/libvirt/qemu.conf` (required for cross-architecture QEMU VMs).
 - **vagrant-libvirt network**: autostart enabled (`virsh net-autostart vagrant-libvirt`). Without this, dnsmasq may die between VM runs, causing silent DHCP failures.
+- **CPU passthrough required for Flynn cluster VMs**: `Vagrantfile` and `cluster-up.sh` both set `libvirt.cpu_mode = "host-passthrough"` / `<cpu mode='host-passthrough'/>`. Without it, guests get a generic `qemu64` CPU model with no AVX exposed — MongoDB 5.0+ crashes with `illegal instruction (core dumped)` on the default model even though this host's physical CPUs support AVX. See implementation-plan.md 2026-08-11/12 entry for the full debugging trail.
 - **Installed emulators**: `qemu-system-x86_64`, `qemu-system-aarch64`, `qemu-system-riscv64`
 - **UEFI firmware**: `qemu-efi-aarch64` (AAVMF), `qemu-efi-riscv64` installed for cross-arch boot.
 - **guestfish / virt-customize**: Used for cross-arch image customization (libguestfs-tools).

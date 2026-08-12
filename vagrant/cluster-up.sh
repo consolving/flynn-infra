@@ -189,7 +189,7 @@ if [[ "$NUM_NODES" -eq 1 ]]; then
     if [[ "$AUTO_BOOTSTRAP" == "true" ]]; then
         info "Bootstrapping single-node cluster..."
         ssh $SSH_OPTS vagrant@"$NODE1_IP" \
-            "sudo CLUSTER_DOMAIN=$CLUSTER_DOMAIN flynn-host bootstrap --min-hosts=1 --peer-ips=$NODE1_IP --timeout=600 2>&1" | tail -20
+            "sudo CLUSTER_DOMAIN=$CLUSTER_DOMAIN flynn-host bootstrap /etc/flynn/bootstrap-manifest.json --min-hosts=1 --peer-ips=$NODE1_IP --timeout=600 --job-timeout=600 2>&1" | tail -40
     fi
     info "Done! (total $(elapsed $TOTAL_START))"
     exit 0
@@ -265,9 +265,17 @@ trap "rm -rf $WORK_DIR" EXIT
 for i in $(seq 2 "$NUM_NODES"); do
     target_ip="$(node_ip "$i")"
 
-    # Modified flynn-host.service with correct external-ip
+    # Modified flynn-host.service with correct external-ip, host id, and tags.
+    # IMPORTANT: node1's original service file has --id=node1 and
+    # --tags=host_id=node1 baked in; every clone MUST get its own unique
+    # host id here too, otherwise all 5 flynn-host daemons register as the
+    # same "node1" in the cluster's distributed job/host tracking, causing
+    # silent job-scheduling corruption (jobs appear "running" in bolt state
+    # but never actually launch on the physical host).
     echo "$SVC_TEMPLATE" \
-        | sed "s/--external-ip=[0-9.]*/--external-ip=${target_ip}/" \
+        | sed -e "s/--external-ip=[0-9.]*/--external-ip=${target_ip}/" \
+              -e "s/--id=node1/--id=node${i}/" \
+              -e "s/--tags=host_id=node1/--tags=host_id=node${i}/" \
         > "${WORK_DIR}/flynn-host-node${i}.service"
 
     # Networkd config for the data interface
@@ -375,6 +383,10 @@ for i in $(seq 2 "$NUM_NODES"); do
   <name>${vm}</name>
   <memory unit='MiB'>${NODE_MEMORY}</memory>
   <vcpu>${NODE_CPUS}</vcpu>
+  <!-- host-passthrough: exposes the real host CPU features (AVX, etc.) to
+       the guest. Without this, clones get a generic QEMU CPU model with no
+       AVX, and MongoDB 5.0+ crashes with SIGILL ("illegal instruction"). -->
+  <cpu mode='host-passthrough'/>
   <os>
     <type arch='x86_64'>hvm</type>
     <boot dev='hd'/>
@@ -488,8 +500,8 @@ if [[ "$AUTO_BOOTSTRAP" == "true" ]]; then
     BOOTSTRAP_IP="$(node_ip "$NUM_NODES")"
     info "Phase 4: Bootstrapping cluster from $BOOTSTRAP_IP..."
     ssh $SSH_OPTS vagrant@"$BOOTSTRAP_IP" \
-        "sudo CLUSTER_DOMAIN=$CLUSTER_DOMAIN flynn-host bootstrap --min-hosts=$NUM_NODES --peer-ips=$ALL_IPS --timeout=600 2>&1" \
-        | tee /dev/stderr | tail -5
+        "sudo CLUSTER_DOMAIN=$CLUSTER_DOMAIN flynn-host bootstrap /etc/flynn/bootstrap-manifest.json --min-hosts=$NUM_NODES --peer-ips=$ALL_IPS --timeout=600 --job-timeout=600 2>&1" \
+        | tee /dev/stderr | tail -20
 
     info "Bootstrap complete!"
     info "  Cluster domain: $CLUSTER_DOMAIN"
@@ -497,7 +509,7 @@ if [[ "$AUTO_BOOTSTRAP" == "true" ]]; then
 else
     info "Skipping bootstrap (AUTO_BOOTSTRAP=false)"
     info "To bootstrap manually:"
-    info "  ssh vagrant@$(node_ip "$NUM_NODES") 'sudo CLUSTER_DOMAIN=$CLUSTER_DOMAIN flynn-host bootstrap --min-hosts=$NUM_NODES --peer-ips=$ALL_IPS --timeout=600'"
+    info "  ssh vagrant@$(node_ip "$NUM_NODES") 'sudo CLUSTER_DOMAIN=$CLUSTER_DOMAIN flynn-host bootstrap /etc/flynn/bootstrap-manifest.json --min-hosts=$NUM_NODES --peer-ips=$ALL_IPS --timeout=600 --job-timeout=600'"
 fi
 
 info "Done! $NUM_NODES-node Flynn cluster is ready. (total $(elapsed $TOTAL_START))"

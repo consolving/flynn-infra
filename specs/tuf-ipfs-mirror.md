@@ -195,6 +195,11 @@ The IPFS directory mirrors the TUF repository exactly:
 12. [ ] Update `sync-ipfs.sh` to include TUF metadata in each publish
 13. [x] Test end-to-end: `flynn-host download` from IPFS-backed gateway — verified 2026-05-18
 
+**Critical correction (2026-08-11/12)**: `dl.consolving.net`'s Traefik `addprefix` middleware is `/ipfs/{CID}/repository/targets` — **flat only**. It cannot resolve any nested subdirectory (e.g. a `layers/` folder under `targets/`). `export-tuf`'s own `layerURLTpl` (`https://dl.consolving.net/{id}.squashfs`) confirms this: every squashfs layer must be synced directly at `repository/targets/{hash}.squashfs`, never nested. `tuf.consolving.net` (full TUF client path resolution) tolerates nesting fine — only the flat `dl.consolving.net` shortcut doesn't. When manually patching in missing content via `sync-ipfs.sh`'s `SRC_DIR`, always place files with `SRC_DIR/{hash}.ext` (flat), matching how their logical TUF target path resolves under `targets/`, not their logical subdirectory grouping.
+
+Also found: `export-tuf` does not write unchanged/cached package-layer squashfs files into the git-tracked `repository/targets/` tree at all — only content that's genuinely new gets staged there. It relies on `/var/lib/flynn/layer-cache` (persistent, content-addressed, gitignored) plus the assumption that IPFS already has everything else from a prior release. This is fine until a release changes package content for images that were previously untouched (non-reproducible `apt-get install` builds mean *any* image's layer hash can drift between `export-tuf` runs) — those new layers exist only in `layer-cache`, never make it into git or an automatic IPFS sync, and need manually cross-checking + syncing. See implementation-plan.md's "Full 5-Node Cluster Deployment" entry for the full recovery recipe.
+
+
 ## Cost
 
 | Item | Monthly Cost |
