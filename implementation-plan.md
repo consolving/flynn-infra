@@ -982,8 +982,32 @@ Successfully ran integration tests against the live single-node Vagrant cluster 
 
 **Remaining tasks**:
 
-- [x] Update `refresh-tuf.yml` GitHub Actions workflow to trigger IPFS re-sync after monthly `timestamp.json` refresh — webhook configured, ready (2026-05-27)
-- [ ] Verify end-to-end: `flynn-host download` from IPFS-backed TUF mirror — partially verified (2026-05-27): new binary successfully initializes TUF client, resolves metadata from both `tuf.consolving.net` and GitHub Pages, but requires `v20260527.0` release artifacts (not yet published to TUF/repo). Full e2e needs: (a) IPFS sync of new metadata on host1, (b) publish v20260527.0 release via `export-tuf`, (c) bootstrap Vagrant cluster with new binary.
+- [x] Update `refresh-tuf.yml` GitHub Actions workflow to trigger IPFS re-sync after monthly `timestamp.json` refresh — webhook configured, ready (2026-05-27). **CORRECTION (2026-09-01)**: the webhook service (`tuf-webhook.service`, port 9442 on host1) exists and runs, but no Traefik router ever exposed `host1.consolving.net/webhook/*` — the cron's POST 404s and IPFS was never auto re-synced. See "IPFS Mirror Recovery" section below.
+- [x] Verify end-to-end: `flynn-host download` from IPFS-backed TUF mirror — **verified 2026-09-01**: fresh scratch TUF client + channel `stable` → `v20260811.0`, full download (3 binaries, bootstrap-manifest.json, images.json, all 21 images / 48 unique layers incl. all previously-missing layers) completed with zero errors against `https://tuf.consolving.net/repository` alone (explicit `--repository`, no GitHub Pages fallback). See "IPFS Mirror Recovery and E2E Verification (2026-09-01)" below.
+
+### IPFS Mirror Recovery and E2E Verification (2026-09-01)
+
+**Findings** (while closing the open e2e item):
+1. **Live timestamp expired**: IPFS (`tuf.consolving.net`, host1+host2, same CID) served timestamp v56 which **expired 2026-08-12T23:16:58Z**. Root cause: the v20260811.0 release commits (`50c6dcc`, `a5d7d88`) re-signed the timestamp with **1-day expiry** (`--expiry-days 1`), so the shipped mirror metadata lapsed. GitHub Pages had been re-signed by the 2026-09-01 cron to v57 (expires 2026-11-30), but the cron's IPFS re-sync step POSTs to `https://host1.consolving.net/webhook/tuf-sync`, which **404s** — no Traefik route exists for the webhook (the `tuf-webhook.service` on port 9442 has been running since 2026-08-27; the external Traefik only defines an `openpeeps` file-provider route plus docker-label routes; nothing forwards `/webhook/*`). The GitHub Actions workflow treats non-202 as a logged warning, so the cron "succeeded" every month while IPFS stayed stale.
+2. **6 squashfs layers missing from the CID** (of 48 unique layers referenced by v20260811.0 `images.json`): builder `97bc968b`, host `4b150048`, slugbuilder-14 `05d1ef48`, slugbuilder-24 `4472674c`, slugrunner `00159700` (shared), updater `e907f5a6`. A sweep of all 465 git-tree files against the CID showed everything else present. This is the latent `export-tuf` layer-sync footgun noted earlier — these layers were never merged into the IPFS content.
+3. **Stale plain `channels/stable`**: git/GitHub Pages had `v20260527.0` while the TUF target `/channels/stable` (consistent name `4664ed...stable`) is `v20260811.0`. The release flow only updated the hash-prefixed copy. TUF clients fetch the hash-prefixed name, so impact was cosmetic — fixed anyway.
+
+**Recovery performed (2026-09-01)**:
+- Ran `/opt/flynn-tuf-dl/refresh-tuf-metadata.sh` on host1 → pulled `3f9cee0` (v57), new CID `bafybeigxx...`, host1+host2 Traefik updated.
+- Fixed plain `repository/targets/channels/stable` → `v20260811.0\n`, pushed to GitHub main (`3e006ff`).
+- Transferred the 6 missing layers from the dev-machine `/var/lib/flynn/layer-cache` (each verified byte-exact with Go `crypto/sha512.New512_256` against layer ID) to host1, ran `/opt/flynn-tuf-dl/sync-ipfs.sh` → new CID `bafybeih74d23qhnigl5wm5rkl3k6svdyzxl32vqdwt5xpoul5yjh72aiji` (now the live CID on host1); propagated to host2 (compose CID + `ipfs pin add` prewarm).
+- Full sweep afterwards: **492/493 paths 200 on each host** (465 git files minus `.nojekyll` + 48 layer IDs); metadata byte-identical between `tuf.consolving.net` and GitHub Pages (root/timestamp/snapshot/targets/consistent-snapshot/channel/binaries, sha512-compared).
+
+**E2E verification (dev machine, scratch tree `/tmp/flynn-e2e-20260901`)**:
+- Dogfooded the mirror: fetched `/v20260811.0/flynn-host.gz` binary from `dl.consolving.net`, sha512 matches target `12dc0306...`, version v20260811.0.
+- `flynn-host download -r https://tuf.consolving.net/repository` with fresh `tuf.db`, `channel.txt=stable`, scratch bin/config/vol dirs: TUF init → channel resolution → binaries (flynn-host/flynn-init/flynn-linux-amd64 v20260811.0) → all 21 images / 48 unique layers (ZFS zvols on `flynn-default`) → bootstrap-manifest.json. **Zero errors**, `download complete`. Explicit `--repository` means no GitHub Pages fallback was available — the IPFS mirror alone is self-sufficient.
+
+**Superseded known issue**: the 2026-08-11 note about stale `dl.consolving.net/flynn-host.gz` (old v20260518 binary `cdf715ab...`) no longer applies — targets.json now points `/flynn-host.gz` → `12dc0306...` (fixed v20260811.0) and that exact file verifies on the mirror.
+
+**Follow-ups**:
+- [x] Add a Traefik router for `Host(host1.consolving.net) && PathPrefix(/webhook)` → tuf-webhook.service so the monthly cron re-syncs IPFS automatically — **done 2026-09-01**: router + service added to `/builds/.../providers/http-forwarders.yml` (file provider, watch:true, no restart). Backend `http://172.19.0.1:9442` (traefik_default bridge gateway). Verified: health 200, wrong-secret POST 403, Traefik logs clean. ACME cert for `host1.consolving.net` already exists. **Caveat**: the GitHub Actions secret `TUF_WEBHOOK_SECRET` may not match host1's `WEBHOOK_SECRET` — the 2026-08-22 cron test got 403 "invalid secret". Check `gh secret list` in `flynn-tuf-repo` and compare with `systemctl cat tuf-webhook` on host1. If mismatched, update the GitHub secret to match host1's value.
+- Release signing must keep 90-day timestamp expiry (v54/v56 shipped with 1-day expiry by mistake — process slip in the v20260811.0 release work; scripts default to 90d).
+- Proper fix for the `export-tuf` layer-sync gap (write ALL layers flat into `repository/targets/` every run) so future releases cannot ship with missing layers on IPFS.
 
 
 ### IPFS-Backed TUF Mirror — End-to-End Cluster Verification (2026-08-11)
