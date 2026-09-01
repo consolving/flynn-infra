@@ -165,6 +165,20 @@ Additionally completed:
 - **runc fork modernization**: The Flynn runc fork (`v1.0.0-rc1001`) is 6+ years behind on security patches. Upgrading requires extracting the veth/loopback networking into Flynn's own code (using `vishvananda/netlink` directly), then migrating to modern runc. This is a significant undertaking tied to Phase 6 cluster bootstrap work.
 - **~~Base layer migration~~**: Complete — migrated to Ubuntu 24.04 Noble in Phase 5.5.
 
+#### runc Fork Patch Analysis for the Phase 6 Upgrade (2026-09-01)
+
+**Status**: Non-blocking, deferred to Phase 6 (cluster bootstrap verification required). Current fork builds clean and is functionally adequate — confirmed `go build ./host` succeeds against `github.com/flynn/runc v1.0.0-rc1001`.
+
+**The two Flynn fork patches (per AGENTS.md + Phase 5 audit, verified in vendored source at `vendor/github.com/opencontainers/runc/`)**:
+1. **veth/loopback network setup restore**: Upstream runc rc8-era removed the per-container veth wiring; the fork restores it in `libcontainer/network_linux.go` — the `veth` strategy (`create`/`attach`/`detach`, lines 107-232) and the `loopback` strategy (lines 87-105), dispatched by `getStrategy` from `configs.Network.Type` (`"veth"`, `"loopback"`).
+2. **cgo cross-compilation fix**: `libcontainer/system/` provides cgo (`sysconfig.go`, `_SC_CLK_TCK`) and non-cgo (`sysconfig_notcgo.go`, returns 100) variants guarded by `// +build cgo,linux` vs `!cgo windows` — allowing builds when CGO is disabled.
+
+**Extraction map — narrower than originally feared**: `host/libcontainer_backend.go` **already** does its own bridge management via `vishvananda/netlink` directly (`ConfigureNetworking`, lines 214-295, imports `netlink` at line 54) and does NOT route bridge setup through runc/libcontainer. The *only* code still coupled to the fork is the **per-container veth creation**: `ConfigureNetworking`/`Start` build a `configs.Network{Type:"veth", Bridge, HostInterfaceName, ...}` (lines 834-854) that libcontainer's veth strategy realizes. So the upgrade surface is:
+- Move veth pair creation into `host/libcontainer_backend.go` (or a local helper) using netlink directly (`LinkAdd(&netlink.Veth{PearName...})`, `LinkSetMaster`, `LinkSetMTU`, `LinkSetUp`), mirroring the existing bridge logic that already uses netlink directly.
+- Then migrate `flynn/runc` → modern upstream runc (v1.2.x), adapting the libcontainer backend API (rc8 → v1.2 has substantial API changes: `Factory.Create`/`configs.Config` fields, cgroup v2 default, namespaces, `Runtime` plumbing). `udbus/dbus` v4→v5 shim disappears; `coreos-pkg` persists until go-systemd is bumped to v22.
+- **Verification is mandatory**: this cannot be validated without a real Phase 6 cluster bootstrap (flannel overlay + discoverd + postgres image with ZFS squashfs layers), since veth wiring is exercised only at container start. A blind upgrade risks silently breaking `flynn-host` container networking.
+- `vishvananda/netlink` is already vendored (`vendor/github.com/vishvananda/netlink/`), so no new dependency is required for extraction.
+
 ## Phase 5.5: Base Image Migration — Ubuntu 18.04 → 24.04 (Complete)
 
 The container base layer images were migrated from Ubuntu 18.04 Bionic (EOL April 2023) to Ubuntu 24.04 LTS Noble Numbat (supported until 2034). This was done in the `noble-migration-and-fixes` branch and merged into master.
