@@ -996,7 +996,7 @@ Successfully ran integration tests against the live single-node Vagrant cluster 
 
 **Remaining tasks**:
 
-- [x] Update `refresh-tuf.yml` GitHub Actions workflow to trigger IPFS re-sync after monthly `timestamp.json` refresh — webhook configured, ready (2026-05-27). **CORRECTION (2026-09-01)**: the webhook service (`tuf-webhook.service`, port 9442 on host1) exists and runs, but no Traefik router ever exposed `host1.consolving.net/webhook/*` — the cron's POST 404s and IPFS was never auto re-synced. See "IPFS Mirror Recovery" section below.
+- [x] Update `refresh-tuf.yml` GitHub Actions workflow to trigger IPFS re-sync after monthly `timestamp.json` refresh — **verified 2026-09-01**: webhook Traefik route added, secret updated, and a manual workflow dispatch succeeded with HTTP 202 from GitHub's public IP. Full details in "IPFS Mirror Recovery and E2E Verification (2026-09-01)" below. (Note: the 2026-05-27 status was premature — the route and secret were not actually wired end-to-end until 2026-09-01.)
 - [x] Verify end-to-end: `flynn-host download` from IPFS-backed TUF mirror — **verified 2026-09-01**: fresh scratch TUF client + channel `stable` → `v20260811.0`, full download (3 binaries, bootstrap-manifest.json, images.json, all 21 images / 48 unique layers incl. all previously-missing layers) completed with zero errors against `https://tuf.consolving.net/repository` alone (explicit `--repository`, no GitHub Pages fallback). See "IPFS Mirror Recovery and E2E Verification (2026-09-01)" below.
 
 ### IPFS Mirror Recovery and E2E Verification (2026-09-01)
@@ -1202,5 +1202,52 @@ Persisted via `iptables-save > /etc/iptables/rules.v4` (loaded by `/etc/network/
 **Known remaining gaps** (not addressed this session, lower priority):
 - Only node1 has the DNAT-facing policy route actively used; other 4 nodes have the fix available via `provision.sh` but it's inert unless that node becomes the DNAT target.
 - `cluster-up.sh`'s "management network sometimes disappears on `vagrant destroy`" (Bug 1) has no permanent fix — still requires manual `virsh net-define`+`net-start` recovery before some redeploys.
-- The broader `export-tuf` layer-sync gap (Bug 4's second finding) is a latent footgun for any future release with changed package content — worth a proper fix in `export-tuf/main.go` (write ALL layers, changed or not, to `repository/targets/{hash}.squashfs` flat, every run) rather than relying on layer-cache + "assume IPFS already has it".
+- ~~The broader `export-tuf` layer-sync gap (Bug 4's second finding) is a latent footgun for any future release with changed package content — worth a proper fix in `export-tuf/main.go` (write ALL layers, changed or not, to `repository/targets/{hash}.squashfs` flat, every run) rather than relying on layer-cache + "assume IPFS already has it".~~ **Fixed 2026-09-01**: source-side flat-layer staging committed as `flynn` `847649e9`.
+
+## Code Review Findings (2026-09-01)
+
+A full scan of the Flynn Go monorepo and the host1 TUF/IPFS scripts was performed. The most actionable findings are grouped below as follow-up todos. Detailed locations and recommendations are in the subsections.
+
+### Security
+- [ ] **CRITICAL**: `test/apps/ish/main.go:52` passes HTTP request bodies directly to `/bin/sh -c`. This test helper is an arbitrary command-execution endpoint. Sandbox it, remove it, or require authentication.
+- [ ] **HIGH**: `appliance/mariadb/cmd/flynn-mariadb-api/main.go:128,133` and `appliance/postgresql/cmd/flynn-postgres-api/main.go:126,131` build `DROP DATABASE`/`DROP USER` with `fmt.Sprintf` using request-provided IDs. Use identifier-quoting helpers (`pq.QuoteIdentifier` for Postgres, backtick-escape for MariaDB) or validate identifiers strictly.
+- [ ] **HIGH**: `controller/scheduler/scheduler.go:2401,879` — `triggerRectify` writes to `s.rectifyBatch` from many goroutines while `HandleRectify` reads/resets it on the main loop without synchronization. Add a mutex or route all writes through the main goroutine.
+- [ ] **HIGH**: `controller/types/types.go:682-683` — `RawManifest()` takes `ImageManifest` by value (copying `sync.Once`) while `Hashes()` may mutate concurrently. Change to a pointer receiver.
+
+### Reliability / Error Handling
+- [ ] **HIGH**: `gitreceive/server.go:408` calls `resp.Body.Close()` before checking whether `http.DefaultClient.Do` returned an error; `resp` may be nil, causing a panic.
+- [ ] **MEDIUM**: Replace unbounded `http.DefaultClient` usage with timeout-bearing clients across the codebase (`gitreceive/server.go`, `updater/updater.go`, `controller/worker/*`, `cli/login/login.go`, `host/cli/gist.go`, `bootstrap/discovery/discovery.go`, `slugbuilder/migrator/main.go`).
+- [ ] **MEDIUM**: `controller/app.go:82` creates `context.WithCancel` but several early returns never call `cancel`. Defer the cancel immediately.
+- [ ] **MEDIUM**: `discoverd/client/instance.go:173` and `discoverd/server/store.go:476` copy `Instance` by value, which contains `sync.Once`. Reset/zero the `sync.Once` when cloning, or copy fields individually.
+- [ ] **MEDIUM**: `controller/scheduler/scheduler.go:1274` copies `*host` by value; `Host` contains `sync.Once`. Copy fields individually and reset the `sync.Once`.
+- [ ] **MEDIUM**: Several panic-on-persistence-failure sites (`host/state.go:348`, `host/volume/manager/manager.go:471`, `pkg/postgres/postgres.go:83`, `controller/data/schema.go:1028`) should return errors instead of crashing the daemon.
+- [ ] **MEDIUM**: `host/state.go:447` dereferences `s.jobs[jobID]` without checking existence.
+- [ ] **MEDIUM**: `bootstrap/discovery/discovery.go:75` reads an HTTP response body without closing it, leaking the connection.
+
+### TUF / IPFS Mirror Operational Hardening
+- [ ] **HIGH**: Add a file lock around publish/mutate operations (`refresh-tuf-metadata.sh`, `sync-ipfs.sh`, `release-and-sync.sh`, `tuf-webhook.py`) so concurrent webhook calls and manual runs cannot race on CID files, MFS, compose files, and IPFS pins.
+- [ ] **MEDIUM**: Harden the webhook handler (`/opt/scripts/tuf-webhook.py`): rate limiting, source-IP allowlist, HMAC request-body signing instead of a shared header, and streaming log output instead of `capture_output=True`.
+- [ ] **MEDIUM**: Enforce SSH host-key verification for host2 propagation (`StrictHostKeyChecking=yes` + pinned `UserKnownHostsFile`).
+- [ ] **MEDIUM**: Add post-update health checks (`curl --fail https://tuf.consolving.net/repository/root.json`) before declaring a refresh successful and before garbage-collecting the old CID.
+- [ ] **MEDIUM**: Keep the previous IPFS CID pinned for a grace period (15–30 min) after Traefik/container updates are confirmed healthy to avoid serving broken content during propagation.
+- [ ] **MEDIUM**: `refresh-tuf-metadata.sh` should pin the new CID explicitly (`ipfs pin add "$NEW_CID"`) and write the CID file only after MFS, compose, and health checks succeed.
+- [ ] **LOW**: Standardize the Docker exec user (`-u ipfs`) across all IPFS scripts.
+
+### Deprecated / Stale Code
+- [ ] **MEDIUM**: Remove or replace stale `flynn.io` references (`bootstrap/discovery/discovery.go:100` discovery service, `controller/schema/schema.go:45,67,69` schema URLs, `cli/install.go:14` install docs).
+- [ ] **MEDIUM**: Remove hardcoded debug credentials (`cmd/event-debug/main.go:13` controller IP/key, `test/test_blobstore.go:63` MinIO key, `test/cluster/instance.go:266` SSH password `ubuntu`).
+- [ ] **LOW**: Finish removing deprecated CLI paths (`cli/docker.go` Docker-registry push, `cli/release.go` `release add`) or move them behind explicit compatibility flags.
+- [ ] **LOW**: Replace deprecated `os.SEEK_SET` with `io.SeekStart` in `tarreceive/main.go`.
+
+### Maintainability / Technical Debt
+- [ ] **MEDIUM**: Refactor oversized functions: `host/libcontainer_backend.go:Run()` (~380 lines), `controller/scheduler/scheduler.go:Run()` and `ControllerPersistLoop()`, `pkg/sirenia/state/state.go:evalClusterState()`.
+- [ ] **MEDIUM**: Address the most impactful TODO comments: scheduler async HTTP calls (`scheduler.go:163`), job attach context cancellation (`controller/jobs.go:246`), host discovery retry (`host/host.go:263`), host updater custom flags (`host/cli/update.go:207`), route non-default ports (`controller/data/route.go:68,90`), job validation (`controller/data/jobs.go:39`).
+- [ ] **LOW**: Make hardcoded tuning parameters configurable (`host/libcontainer_backend.go` paths/MTU/PATH, `appliance/postgresql/process.go` `max_connections`/`shared_buffers`, `controller/scheduler/scheduler.go` buffer sizes/timeouts, `discoverd/server/store.go` Raft timeouts).
+- [ ] **LOW**: Add HTTP server timeouts (`ReadTimeout`/`WriteTimeout`/`IdleTimeout`) to public/internal endpoints (`controller`, `gitreceive`, `blobstore`, appliance APIs, scheduler).
+
+### Noted but Acceptable
+- `discoverd/health/check.go:78` disables TLS verification for internal health probes; acceptable if documented, but should require a CA bundle for public-network health checks.
+- `host/logmux/sink.go:550` allows `syslog+tls` sinks to disable cert verification; acceptable if clearly documented and off by default.
+- `controller/data/route.go:426` uses `crypto/md5` for event deduplication only; non-cryptographic, but should be documented or migrated to SHA-256.
+- `appliance/postgresql/process.go:1007` sets `password_encryption = md5`; evaluate moving to `scram-sha-256` if client compatibility allows.
 
