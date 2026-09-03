@@ -1224,31 +1224,31 @@ The following Go code review items were fixed and verified (`go build ./...`, `g
 - **LOW**: `tarreceive/main.go` `os.SEEK_SET` → `io.SeekStart`.
 - **vendor**: synced `modules.txt` + added dashboard deps (`gorilla/context`, `gorilla/securecookie`, `gorilla/sessions`, `jvatic/asset-matrix-go`) required by the dashboard restore.
 
-**Deferred / not addressed here**: unbounded `http.DefaultClient` replacements (timeout clients), panic-on-persistence sites, deprecated CLI paths (`cli/docker.go`, `cli/release.go` — intentionally retained), remaining maintainability refactors, and all TUF/IPFS operational-hardening items below.
+**Deferred / not addressed here**: deprecated CLI paths (`cli/docker.go`, `cli/release.go` — intentionally retained) and remaining maintainability refactors.
 
 ### Security
-- [ ] **CRITICAL**: `test/apps/ish/main.go:52` passes HTTP request bodies directly to `/bin/sh -c`. This test helper is an arbitrary command-execution endpoint. Sandbox it, remove it, or require authentication.
-- [ ] **HIGH**: `appliance/mariadb/cmd/flynn-mariadb-api/main.go:128,133` and `appliance/postgresql/cmd/flynn-postgres-api/main.go:126,131` build `DROP DATABASE`/`DROP USER` with `fmt.Sprintf` using request-provided IDs. Use identifier-quoting helpers (`pq.QuoteIdentifier` for Postgres, backtick-escape for MariaDB) or validate identifiers strictly.
-- [ ] **HIGH**: `controller/scheduler/scheduler.go:2401,879` — `triggerRectify` writes to `s.rectifyBatch` from many goroutines while `HandleRectify` reads/resets it on the main loop without synchronization. Add a mutex or route all writes through the main goroutine.
-- [ ] **HIGH**: `controller/types/types.go:682-683` — `RawManifest()` takes `ImageManifest` by value (copying `sync.Once`) while `Hashes()` may mutate concurrently. Change to a pointer receiver.
+- [x] **CRITICAL**: `test/apps/ish/main.go:52` passes HTTP request bodies directly to `/bin/sh -c`. This test helper is an arbitrary command-execution endpoint. Sandbox it, remove it, or require authentication. (require bearer token — fixed in 197d580c)
+- [x] **HIGH**: `appliance/mariadb/cmd/flynn-mariadb-api/main.go:128,133` and `appliance/postgresql/cmd/flynn-postgres-api/main.go:126,131` build `DROP DATABASE`/`DROP USER` with `fmt.Sprintf` using request-provided IDs. Use identifier-quoting helpers (`pq.QuoteIdentifier` for Postgres, backtick-escape for MariaDB) or validate identifiers strictly. (validHexID validation — fixed in d98a1f06)
+- [x] **HIGH**: `controller/scheduler/scheduler.go:2401,879` — `triggerRectify` writes to `s.rectifyBatch` from many goroutines while `HandleRectify` reads/resets it on the main loop without synchronization. Add a mutex or route all writes through the main goroutine. (rectifyMu.Lock() — fixed in fcfd84c9)
+- [x] **HIGH**: `controller/types/types.go:682-683` — `RawManifest()` takes `ImageManifest` by value (copying `sync.Once`) while `Hashes()` may mutate concurrently. Change to a pointer receiver. (fixed in 89696139)
 
 ### Reliability / Error Handling
 - [x] **HIGH**: `gitreceive/server.go:408` calls `resp.Body.Close()` before checking whether `http.DefaultClient.Do` returned an error; `resp` may be nil, causing a panic.
-- [ ] **MEDIUM**: Replace unbounded `http.DefaultClient` usage with timeout-bearing clients across the codebase (`gitreceive/server.go`, `updater/updater.go`, `controller/worker/*`, `cli/login/login.go`, `host/cli/gist.go`, `bootstrap/discovery/discovery.go`, `slugbuilder/migrator/main.go`).
+- [x] **MEDIUM**: Replace unbounded `http.DefaultClient` usage with timeout-bearing clients across the codebase (`gitreceive/server.go`, `updater/updater.go`, `controller/worker/*`, `cli/login/login.go`, `host/cli/gist.go`, `bootstrap/discovery/discovery.go`, `slugbuilder/migrator/main.go`). (30s `http.Client` added in 27b66863)
 - [x] **MEDIUM**: `controller/app.go:82` creates `context.WithCancel` but several early returns never call `cancel`. Defer the cancel immediately.
 - [x] **MEDIUM**: `discoverd/client/instance.go:173` and `discoverd/server/store.go:476` copy `Instance` by value, which contains `sync.Once`. Reset/zero the `sync.Once` when cloning, or copy fields individually.
 - [x] **MEDIUM**: `controller/scheduler/scheduler.go:1274` copies `*host` by value; `Host` contains `sync.Once`. Copy fields individually and reset the `sync.Once`.
-- [ ] **MEDIUM**: Several panic-on-persistence-failure sites (`host/state.go:348`, `host/volume/manager/manager.go:471`, `pkg/postgres/postgres.go:83`, `controller/data/schema.go:1028`) should return errors instead of crashing the daemon.
+- [x] **MEDIUM**: Several panic-on-persistence-failure sites (`host/state.go:348`, `host/volume/manager/manager.go:471`, `pkg/postgres/postgres.go:83`, `controller/data/schema.go:1028`) should return errors instead of crashing the daemon. (log-and-continue / shutdown.Fatal / return error in 2fc5e04f)
 - [x] **MEDIUM**: `host/state.go:447` dereferences `s.jobs[jobID]` without checking existence.
 - [x] **MEDIUM**: `bootstrap/discovery/discovery.go:75` reads an HTTP response body without closing it, leaking the connection.
 
 ### TUF / IPFS Mirror Operational Hardening
-- [ ] **HIGH**: Add a file lock around publish/mutate operations (`refresh-tuf-metadata.sh`, `sync-ipfs.sh`, `release-and-sync.sh`, `tuf-webhook.py`) so concurrent webhook calls and manual runs cannot race on CID files, MFS, compose files, and IPFS pins.
-- [ ] **MEDIUM**: Harden the webhook handler (`/opt/scripts/tuf-webhook.py`): rate limiting, source-IP allowlist, HMAC request-body signing instead of a shared header, and streaming log output instead of `capture_output=True`.
-- [ ] **MEDIUM**: Enforce SSH host-key verification for host2 propagation (`StrictHostKeyChecking=yes` + pinned `UserKnownHostsFile`).
-- [ ] **MEDIUM**: Add post-update health checks (`curl --fail https://tuf.consolving.net/repository/root.json`) before declaring a refresh successful and before garbage-collecting the old CID.
-- [ ] **MEDIUM**: Keep the previous IPFS CID pinned for a grace period (15–30 min) after Traefik/container updates are confirmed healthy to avoid serving broken content during propagation.
-- [ ] **MEDIUM**: `refresh-tuf-metadata.sh` should pin the new CID explicitly (`ipfs pin add "$NEW_CID"`) and write the CID file only after MFS, compose, and health checks succeed.
+- [x] **HIGH**: Add a file lock around publish/mutate operations (`refresh-tuf-metadata.sh`, `sync-ipfs.sh`, `release-and-sync.sh`, `tuf-webhook.py`) so concurrent webhook calls and manual runs cannot race on CID files, MFS, compose files, and IPFS pins. (flock on fd 9, 300s timeout, all scripts)
+- [x] **MEDIUM**: Harden the webhook handler (`/opt/scripts/tuf-webhook.py`): rate limiting, source-IP allowlist, HMAC request-body signing instead of a shared header, and streaming log output instead of `capture_output=True`. (HMAC body sig, per-IP rate limit, MAX_RUNNING=1, ALLOWED_SOURCES, /webhook/health)
+- [x] **MEDIUM**: Enforce SSH host-key verification for host2 propagation (`StrictHostKeyChecking=yes` + pinned `UserKnownHostsFile`). (pinned `/opt/flynn-tuf-dl/host2_known_hosts`, `SSH_HOST2` var in all scripts)
+- [x] **MEDIUM**: Add post-update health checks (`curl --fail https://tuf.consolving.net/repository/root.json`) before declaring a refresh successful and before garbage-collecting the old CID. (5 attempts/5s, abort promotion on failure)
+- [x] **MEDIUM**: Keep the previous IPFS CID pinned for a grace period (15–30 min) after Traefik/container updates are confirmed healthy to avoid serving broken content during propagation. (CID_GRACE_SECONDS=1800, background unpin+GC)
+- [x] **MEDIUM**: `refresh-tuf-metadata.sh` should pin the new CID explicitly (`ipfs pin add "$NEW_CID"`) and write the CID file only after MFS, compose, and health checks succeed. (pin-add after add, CID file write after health pass)
 - [ ] **LOW**: Standardize the Docker exec user (`-u ipfs`) across all IPFS scripts.
 
 ### Deprecated / Stale Code
