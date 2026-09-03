@@ -1263,6 +1263,23 @@ The following Go code review items were fixed and verified (`go build ./...`, `g
 - [ ] **LOW**: Make hardcoded tuning parameters configurable (`host/libcontainer_backend.go` paths/MTU/PATH, `appliance/postgresql/process.go` `max_connections`/`shared_buffers`, `controller/scheduler/scheduler.go` buffer sizes/timeouts, `discoverd/server/store.go` Raft timeouts).
 - [ ] **LOW**: Add HTTP server timeouts (`ReadTimeout`/`WriteTimeout`/`IdleTimeout`) to public/internal endpoints (`controller`, `gitreceive`, `blobstore`, appliance APIs, scheduler).
 
+## Dashboard Deployment (2026-09-03)
+
+The Flynn web dashboard has been restored, built end-to-end, and deployed to the demo cluster.
+
+- [x] Fix `node-sass` → `sass` (dart-sass) in vendored `asset-matrix-go` so the dashboard asset pipeline builds on Node 20.
+- [x] Verify full dashboard build: `dashboard-compile` → `go-bindata` → `flynn-dashboard` binary.
+- [x] Build `flynn-dashboard:test` Docker image.
+- [x] Bootstrap a 5-node Flynn demo cluster (`demo.localflynn.com`).
+- [x] Deploy dashboard in the cluster via `flynn docker push` and expose at `https://dashboard.demo.localflynn.com`.
+
+**Access**:
+- URL: `https://dashboard.demo.localflynn.com`
+- Login token: `d5c16b97a6c6042a7e393cfcbcf6ddf7`
+- The TLS certificate is the cluster's self-signed controller cert; accept the security warning in the browser.
+
+**Note**: The dashboard is currently deployed from a locally built Docker image, not yet published as a TUF target. To make it part of the official release, it must be added to `builder/manifest.json`, built by `script/export-tuf`, signed, and published to the TUF repository.
+
 ### Noted but Acceptable
 - `discoverd/health/check.go:78` disables TLS verification for internal health probes; acceptable if documented, but should require a CA bundle for public-network health checks.
 - `host/logmux/sink.go:550` allows `syslog+tls` sinks to disable cert verification; acceptable if clearly documented and off by default.
