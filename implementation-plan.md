@@ -1275,10 +1275,38 @@ The Flynn web dashboard has been restored, built end-to-end, and deployed to the
 
 **Access**:
 - URL: `https://dashboard.demo.localflynn.com`
-- Login token: `d5c16b97a6c6042a7e393cfcbcf6ddf7`
+- Login token: `cf1cc11ed7e6f1dcfb88e1c6a3519508` (current v20260904.0 cluster; the old `d5c16b97…` is stale after the fresh rebuild — a new random token is generated each bootstrap)
 - The TLS certificate is the cluster's self-signed controller cert; accept the security warning in the browser.
 
 **Note**: The dashboard is currently deployed from a locally built Docker image, not yet published as a TUF target. To make it part of the official release, it must be added to `builder/manifest.json`, built by `script/export-tuf`, signed, and published to the TUF repository.
+
+### Update (2026-09-04, v20260904.0 rebuild)
+
+The cluster was rebuilt fresh on node1 with the `v20260904.0` flynn-host binary (after destroying the stale golden node1 whose `/usr/local/bin/flynn-host` was a `dev` build), producing a 5-node cluster where all nodes report `v20260904.0`.
+
+**Important finding — stale `vagrant/bootstrap-manifest.json`**: The dashboard IS now a real TUF image artifact. Flynn commit `90346aa3` re-integrated the dashboard into `bootstrap/manifest_template.json` (steps `dashboard-session-secret`, `dashboard-login-token`, `dashboard` deploy-app, `dashboard-route`, plus dashboard token in `log-complete`), and `export-tuf` renders it into `flynn/build/manifests/bootstrap-manifest.json` (dashboard image artifact `c777b74d…`). **However, the deployed `vagrant/bootstrap-manifest.json` is a hand-maintained stale copy (last updated `0561bb6`, v20260902.0) that has NO dashboard steps** — so a `cluster-up.sh` bootstrap does NOT deploy the dashboard. Fix: copy `flynn/build/manifests/bootstrap-manifest.json` over `vagrant/bootstrap-manifest.json` (they match the same v20260904.0 artifacts).
+
+**Manual dashboard redeploy on an already-running cluster** (verified working on 2026-09-04):
+1. In a clean (non-git) dir: `flynn create dashboard` (answer `yes` to git-remote replace prompt only if a `flynn` remote exists).
+2. `flynn docker push flynn-dashboard:test` — pushes the locally-built image (creates a release with process type `app`, port 8080, service `dashboard-web`).
+3. Set env: `flynn env set DEFAULT_ROUTE_DOMAIN=demo.localflynn.com CONTROLLER_DOMAIN=controller.demo.localflynn.com CONTROLLER_KEY=<controller-key> STATUS_KEY=<status-key> URL=https://dashboard.demo.localflynn.com SESSION_SECRET=<random> LOGIN_TOKEN=<random> APP_NAME=dashboard SECURE_COOKIES=true` (`<controller-key>`/`<status-key>` from the bootstrap output).
+4. `flynn scale app=2` (process type is `app`, NOT `web`).
+5. Add route: `flynn route add http -s dashboard-web dashboard.demo.localflynn.com` (the default Web URL route from `flynn create` already registers the domain).
+
+**Verified**: `https://dashboard.demo.localflynn.com` → HTTP 200 (full dashboard UI), login `POST /user/sessions` → 302, `/config` returns working controller/status endpoints.
+
+**Login troubleshooting — "token not correct" / HTTP 401 on `POST /user/sessions`** (2026-09-04): The token is correct server-side (confirmed via full session flow: `POST /user/sessions` with the raw token returns 302 + session cookie; wrong token returns 401). A 401 is a client-side input problem, caused by either:
+
+1. **URL-as-token**: Navigating to `https://dashboard.demo.localflynn.com/?token=<token>` makes the dashboard JS read the **entire URL** (`{"token":"https://dashboard.demo.localflynn.com/?token=..."}`) as the token value, which never matches. To log in, open plain `https://dashboard.demo.localflynn.com` (no query string) and paste the **raw token** into the login field, or `curl` it directly:
+   ```bash
+   curl 'https://dashboard.demo.localflynn.com/user/sessions' -X POST \
+     -H 'Content-Type: application/json' \
+     --data-raw '{"token":"cf1cc11ed7e6f1dcfb88e1c6a3519508"}'
+   ```
+   → 302 + session cookie.
+2. **Typo in the token** (easy to mis-type; it is the same chars as the controller key prefix). The real token is 32 chars: `cf1cc11ed7e6f1dcfb88e1c6a3519508` (note `cf1cc11…` — digit `1`s, no lowercase `l`). Copy-paste it rather than typing.
+
+Also, clear the browser cache/hard-reload once: an old service worker or autofill may still serve the stale `d5c16b97…` token from the previous cluster.
 
 ### Noted but Acceptable
 - `discoverd/health/check.go:78` disables TLS verification for internal health probes; acceptable if documented, but should require a CA bundle for public-network health checks.
