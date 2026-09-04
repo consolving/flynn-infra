@@ -1208,42 +1208,77 @@ Persisted via `iptables-save > /etc/iptables/rules.v4` (loaded by `/etc/network/
 
 A full scan of the Flynn Go monorepo and the host1 TUF/IPFS scripts was performed. The most actionable findings are grouped below as follow-up todos. Detailed locations and recommendations are in the subsections.
 
+### Completed (2026-09-03, flynn `4103e13e`, branch `dashboard-v20260902`)
+
+The following Go code review items were fixed and verified (`go build ./...`, `go vet` on changed packages, standalone unit tests pass). The `flynn` submodule commit is `4103e13e`.
+
+- **Security**: ish auth (`197d580c`, earlier), resource ID SQL injection (`d98a1f06`, earlier), scheduler rectify race (`fcfd84c9`, earlier), `RawManifest` pointer receiver (`89696139`, earlier) — already fixed before this session.
+- **HIGH `gitreceive/server.go`**: check `http.DefaultClient.Do` error before using `resp` (fixes nil-pointer panic); drain response body for connection reuse; return nil on success.
+- **MEDIUM `discoverd/client/instance.go` + `discoverd/server/store.go`**: `Clone()` copies fields individually (no longer shallow-copies `addrOnce sync.Once`); store uses `inst.Clone()`.
+- **MEDIUM `controller/scheduler/scheduler.go`**: copies `Host` fields individually (no longer shallow-copies `stopOnce sync.Once`).
+- **MEDIUM `controller/app.go`**: `defer cancel()` immediately after `context.WithCancel`.
+- **MEDIUM `host/state.go`**: `SetContainerIP`/`SetContainerPID` existence-check the job before dereferencing.
+- **MEDIUM `bootstrap/discovery`**: close response bodies in `RegisterInstance`/`NewToken`; require `DISCOVERY_SERVER` env var instead of dead `discovery.flynn.io` default.
+- **MEDIUM stale docs**: `cli/install.go`, `host/cli/cli-add-command.go`, `host/cli/update.go` point to `flynn.io` (offline) → `github.com/consolving/flynn`.
+- **MEDIUM hardcoded credentials**: `cmd/event-debug` reads `FLYNN_CONTROLLER`/`FLYNN_KEY`; test MinIO creds and SSH creds read from env vars (current values remain defaults).
+- **LOW**: `tarreceive/main.go` `os.SEEK_SET` → `io.SeekStart`.
+- **vendor**: synced `modules.txt` + added dashboard deps (`gorilla/context`, `gorilla/securecookie`, `gorilla/sessions`, `jvatic/asset-matrix-go`) required by the dashboard restore.
+
+**Deferred / not addressed here**: deprecated CLI paths (`cli/docker.go`, `cli/release.go` — intentionally retained) and remaining maintainability refactors.
+
 ### Security
-- [ ] **CRITICAL**: `test/apps/ish/main.go:52` passes HTTP request bodies directly to `/bin/sh -c`. This test helper is an arbitrary command-execution endpoint. Sandbox it, remove it, or require authentication.
-- [ ] **HIGH**: `appliance/mariadb/cmd/flynn-mariadb-api/main.go:128,133` and `appliance/postgresql/cmd/flynn-postgres-api/main.go:126,131` build `DROP DATABASE`/`DROP USER` with `fmt.Sprintf` using request-provided IDs. Use identifier-quoting helpers (`pq.QuoteIdentifier` for Postgres, backtick-escape for MariaDB) or validate identifiers strictly.
-- [ ] **HIGH**: `controller/scheduler/scheduler.go:2401,879` — `triggerRectify` writes to `s.rectifyBatch` from many goroutines while `HandleRectify` reads/resets it on the main loop without synchronization. Add a mutex or route all writes through the main goroutine.
-- [ ] **HIGH**: `controller/types/types.go:682-683` — `RawManifest()` takes `ImageManifest` by value (copying `sync.Once`) while `Hashes()` may mutate concurrently. Change to a pointer receiver.
+- [x] **CRITICAL**: `test/apps/ish/main.go:52` passes HTTP request bodies directly to `/bin/sh -c`. This test helper is an arbitrary command-execution endpoint. Sandbox it, remove it, or require authentication. (require bearer token — fixed in 197d580c)
+- [x] **HIGH**: `appliance/mariadb/cmd/flynn-mariadb-api/main.go:128,133` and `appliance/postgresql/cmd/flynn-postgres-api/main.go:126,131` build `DROP DATABASE`/`DROP USER` with `fmt.Sprintf` using request-provided IDs. Use identifier-quoting helpers (`pq.QuoteIdentifier` for Postgres, backtick-escape for MariaDB) or validate identifiers strictly. (validHexID validation — fixed in d98a1f06)
+- [x] **HIGH**: `controller/scheduler/scheduler.go:2401,879` — `triggerRectify` writes to `s.rectifyBatch` from many goroutines while `HandleRectify` reads/resets it on the main loop without synchronization. Add a mutex or route all writes through the main goroutine. (rectifyMu.Lock() — fixed in fcfd84c9)
+- [x] **HIGH**: `controller/types/types.go:682-683` — `RawManifest()` takes `ImageManifest` by value (copying `sync.Once`) while `Hashes()` may mutate concurrently. Change to a pointer receiver. (fixed in 89696139)
 
 ### Reliability / Error Handling
-- [ ] **HIGH**: `gitreceive/server.go:408` calls `resp.Body.Close()` before checking whether `http.DefaultClient.Do` returned an error; `resp` may be nil, causing a panic.
-- [ ] **MEDIUM**: Replace unbounded `http.DefaultClient` usage with timeout-bearing clients across the codebase (`gitreceive/server.go`, `updater/updater.go`, `controller/worker/*`, `cli/login/login.go`, `host/cli/gist.go`, `bootstrap/discovery/discovery.go`, `slugbuilder/migrator/main.go`).
-- [ ] **MEDIUM**: `controller/app.go:82` creates `context.WithCancel` but several early returns never call `cancel`. Defer the cancel immediately.
-- [ ] **MEDIUM**: `discoverd/client/instance.go:173` and `discoverd/server/store.go:476` copy `Instance` by value, which contains `sync.Once`. Reset/zero the `sync.Once` when cloning, or copy fields individually.
-- [ ] **MEDIUM**: `controller/scheduler/scheduler.go:1274` copies `*host` by value; `Host` contains `sync.Once`. Copy fields individually and reset the `sync.Once`.
-- [ ] **MEDIUM**: Several panic-on-persistence-failure sites (`host/state.go:348`, `host/volume/manager/manager.go:471`, `pkg/postgres/postgres.go:83`, `controller/data/schema.go:1028`) should return errors instead of crashing the daemon.
-- [ ] **MEDIUM**: `host/state.go:447` dereferences `s.jobs[jobID]` without checking existence.
-- [ ] **MEDIUM**: `bootstrap/discovery/discovery.go:75` reads an HTTP response body without closing it, leaking the connection.
+- [x] **HIGH**: `gitreceive/server.go:408` calls `resp.Body.Close()` before checking whether `http.DefaultClient.Do` returned an error; `resp` may be nil, causing a panic.
+- [x] **MEDIUM**: Replace unbounded `http.DefaultClient` usage with timeout-bearing clients across the codebase (`gitreceive/server.go`, `updater/updater.go`, `controller/worker/*`, `cli/login/login.go`, `host/cli/gist.go`, `bootstrap/discovery/discovery.go`, `slugbuilder/migrator/main.go`). (30s `http.Client` added in 27b66863)
+- [x] **MEDIUM**: `controller/app.go:82` creates `context.WithCancel` but several early returns never call `cancel`. Defer the cancel immediately.
+- [x] **MEDIUM**: `discoverd/client/instance.go:173` and `discoverd/server/store.go:476` copy `Instance` by value, which contains `sync.Once`. Reset/zero the `sync.Once` when cloning, or copy fields individually.
+- [x] **MEDIUM**: `controller/scheduler/scheduler.go:1274` copies `*host` by value; `Host` contains `sync.Once`. Copy fields individually and reset the `sync.Once`.
+- [x] **MEDIUM**: Several panic-on-persistence-failure sites (`host/state.go:348`, `host/volume/manager/manager.go:471`, `pkg/postgres/postgres.go:83`, `controller/data/schema.go:1028`) should return errors instead of crashing the daemon. (log-and-continue / shutdown.Fatal / return error in 2fc5e04f)
+- [x] **MEDIUM**: `host/state.go:447` dereferences `s.jobs[jobID]` without checking existence.
+- [x] **MEDIUM**: `bootstrap/discovery/discovery.go:75` reads an HTTP response body without closing it, leaking the connection.
 
 ### TUF / IPFS Mirror Operational Hardening
-- [ ] **HIGH**: Add a file lock around publish/mutate operations (`refresh-tuf-metadata.sh`, `sync-ipfs.sh`, `release-and-sync.sh`, `tuf-webhook.py`) so concurrent webhook calls and manual runs cannot race on CID files, MFS, compose files, and IPFS pins.
-- [ ] **MEDIUM**: Harden the webhook handler (`/opt/scripts/tuf-webhook.py`): rate limiting, source-IP allowlist, HMAC request-body signing instead of a shared header, and streaming log output instead of `capture_output=True`.
-- [ ] **MEDIUM**: Enforce SSH host-key verification for host2 propagation (`StrictHostKeyChecking=yes` + pinned `UserKnownHostsFile`).
-- [ ] **MEDIUM**: Add post-update health checks (`curl --fail https://tuf.consolving.net/repository/root.json`) before declaring a refresh successful and before garbage-collecting the old CID.
-- [ ] **MEDIUM**: Keep the previous IPFS CID pinned for a grace period (15–30 min) after Traefik/container updates are confirmed healthy to avoid serving broken content during propagation.
-- [ ] **MEDIUM**: `refresh-tuf-metadata.sh` should pin the new CID explicitly (`ipfs pin add "$NEW_CID"`) and write the CID file only after MFS, compose, and health checks succeed.
+- [x] **HIGH**: Add a file lock around publish/mutate operations (`refresh-tuf-metadata.sh`, `sync-ipfs.sh`, `release-and-sync.sh`, `tuf-webhook.py`) so concurrent webhook calls and manual runs cannot race on CID files, MFS, compose files, and IPFS pins. (flock on fd 9, 300s timeout, all scripts)
+- [x] **MEDIUM**: Harden the webhook handler (`/opt/scripts/tuf-webhook.py`): rate limiting, source-IP allowlist, HMAC request-body signing instead of a shared header, and streaming log output instead of `capture_output=True`. (HMAC body sig, per-IP rate limit, MAX_RUNNING=1, ALLOWED_SOURCES, /webhook/health)
+- [x] **MEDIUM**: Enforce SSH host-key verification for host2 propagation (`StrictHostKeyChecking=yes` + pinned `UserKnownHostsFile`). (pinned `/opt/flynn-tuf-dl/host2_known_hosts`, `SSH_HOST2` var in all scripts)
+- [x] **MEDIUM**: Add post-update health checks (`curl --fail https://tuf.consolving.net/repository/root.json`) before declaring a refresh successful and before garbage-collecting the old CID. (5 attempts/5s, abort promotion on failure)
+- [x] **MEDIUM**: Keep the previous IPFS CID pinned for a grace period (15–30 min) after Traefik/container updates are confirmed healthy to avoid serving broken content during propagation. (CID_GRACE_SECONDS=1800, background unpin+GC)
+- [x] **MEDIUM**: `refresh-tuf-metadata.sh` should pin the new CID explicitly (`ipfs pin add "$NEW_CID"`) and write the CID file only after MFS, compose, and health checks succeed. (pin-add after add, CID file write after health pass)
 - [ ] **LOW**: Standardize the Docker exec user (`-u ipfs`) across all IPFS scripts.
 
 ### Deprecated / Stale Code
-- [ ] **MEDIUM**: Remove or replace stale `flynn.io` references (`bootstrap/discovery/discovery.go:100` discovery service, `controller/schema/schema.go:45,67,69` schema URLs, `cli/install.go:14` install docs).
-- [ ] **MEDIUM**: Remove hardcoded debug credentials (`cmd/event-debug/main.go:13` controller IP/key, `test/test_blobstore.go:63` MinIO key, `test/cluster/instance.go:266` SSH password `ubuntu`).
+- [x] **MEDIUM**: Remove or replace stale `flynn.io` references (`bootstrap/discovery/discovery.go:100` discovery service, `cli/install.go:14` install docs). Note: `controller/schema/schema.go:45,67,69` cache keys retained (internal map keys, functionally harmless).
+- [x] **MEDIUM**: Remove hardcoded debug credentials (`cmd/event-debug/main.go:13` controller IP/key, `test/test_blobstore.go:63` MinIO key, `test/cluster/instance.go:266` SSH password `ubuntu`).
 - [ ] **LOW**: Finish removing deprecated CLI paths (`cli/docker.go` Docker-registry push, `cli/release.go` `release add`) or move them behind explicit compatibility flags.
-- [ ] **LOW**: Replace deprecated `os.SEEK_SET` with `io.SeekStart` in `tarreceive/main.go`.
+- [x] **LOW**: Replace deprecated `os.SEEK_SET` with `io.SeekStart` in `tarreceive/main.go`.
 
 ### Maintainability / Technical Debt
 - [ ] **MEDIUM**: Refactor oversized functions: `host/libcontainer_backend.go:Run()` (~380 lines), `controller/scheduler/scheduler.go:Run()` and `ControllerPersistLoop()`, `pkg/sirenia/state/state.go:evalClusterState()`.
 - [ ] **MEDIUM**: Address the most impactful TODO comments: scheduler async HTTP calls (`scheduler.go:163`), job attach context cancellation (`controller/jobs.go:246`), host discovery retry (`host/host.go:263`), host updater custom flags (`host/cli/update.go:207`), route non-default ports (`controller/data/route.go:68,90`), job validation (`controller/data/jobs.go:39`).
 - [ ] **LOW**: Make hardcoded tuning parameters configurable (`host/libcontainer_backend.go` paths/MTU/PATH, `appliance/postgresql/process.go` `max_connections`/`shared_buffers`, `controller/scheduler/scheduler.go` buffer sizes/timeouts, `discoverd/server/store.go` Raft timeouts).
 - [ ] **LOW**: Add HTTP server timeouts (`ReadTimeout`/`WriteTimeout`/`IdleTimeout`) to public/internal endpoints (`controller`, `gitreceive`, `blobstore`, appliance APIs, scheduler).
+
+## Dashboard Deployment (2026-09-03)
+
+The Flynn web dashboard has been restored, built end-to-end, and deployed to the demo cluster.
+
+- [x] Fix `node-sass` → `sass` (dart-sass) in vendored `asset-matrix-go` so the dashboard asset pipeline builds on Node 20.
+- [x] Verify full dashboard build: `dashboard-compile` → `go-bindata` → `flynn-dashboard` binary.
+- [x] Build `flynn-dashboard:test` Docker image.
+- [x] Bootstrap a 5-node Flynn demo cluster (`demo.localflynn.com`).
+- [x] Deploy dashboard in the cluster via `flynn docker push` and expose at `https://dashboard.demo.localflynn.com`.
+
+**Access**:
+- URL: `https://dashboard.demo.localflynn.com`
+- Login token: `d5c16b97a6c6042a7e393cfcbcf6ddf7`
+- The TLS certificate is the cluster's self-signed controller cert; accept the security warning in the browser.
+
+**Note**: The dashboard is currently deployed from a locally built Docker image, not yet published as a TUF target. To make it part of the official release, it must be added to `builder/manifest.json`, built by `script/export-tuf`, signed, and published to the TUF repository.
 
 ### Noted but Acceptable
 - `discoverd/health/check.go:78` disables TLS verification for internal health probes; acceptable if documented, but should require a CA bundle for public-network health checks.
