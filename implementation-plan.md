@@ -1314,3 +1314,26 @@ Also, clear the browser cache/hard-reload once: an old service worker or autofil
 - `controller/data/route.go:426` uses `crypto/md5` for event deduplication only; non-cryptographic, but should be documented or migrated to SHA-256.
 - `appliance/postgresql/process.go:1007` sets `password_encryption = md5`; evaluate moving to `scram-sha-256` if client compatibility allows.
 
+## ACME / Let's Encrypt Certificate Management (Issue #12)
+
+Implementing issue #12: integrate `pkg/autocert` (lego v4-based ACME manager, foundation commit `6da767db`) into the controller so apps can obtain/revoke Let's Encrypt certificates via HTTP-01 and DNS-01 challenges, plus a CLI interface.
+
+**Branch**: `feat/letsencrypt` (flynn submodule HEAD `bfd4bd98`, parent bump `dcbd2d6`)
+
+### Status (2026-09-05)
+- [x] **Controller API** (`controller/acme.go`): `POST /certs/letsencrypt` (provision), `GET /certs/letsencrypt` (list), `GET|DELETE /certs/letsencrypt/:domain` (status/revoke), `GET|PUT /certs/letsencrypt/config` (ACME config). Revocation deletes storage only after successful ACME revocation. `acmeObtainMtx` serializes obtain/renew/revoke to avoid duplicate ACME orders.
+- [x] **Challenge route**: `/.well-known/acme-challenge/*token` mounted on the unauthenticated HTTP server path (alongside `/ca-cert`) so Let's Encrypt can reach the HTTP-01 responder without credentials.
+- [x] **Persistence** (migration 50): `acme_accounts` (email UNIQUE, private_key, registration) and `acme_certificates` (domain, domains text[], cert, key, cert_url, account_email, expires_at, deleted_at, partial unique index on domain WHERE deleted_at IS NULL). `controller/data/acme.go` implements `autocert.Store` over `pkg/postgres` prepared statements.
+- [x] **Config**: boot-time env vars `ACME_EMAIL`, `ACME_CA_URL`, `ACME_CHALLENGE_TYPE`, `ACME_DNS_PROVIDER`, `ACME_DNS_CONFIG`; runtime updates via `PUT /certs/letsencrypt/config` swap the lego Manager in place.
+- [x] **Renewal**: 24h loop calling `Manager.RenewDue()`; also exported `Revoke` + `HTTP01Provider()` from `pkg/autocert`.
+- [x] **Client** (`controller/client`): `ProvisionACMECert`, `ACMECertList`, `GetACMECert`, `RevokeACMECert`, `GetACMEConfig`, `UpdateACMEConfig`.
+- [x] **CLI** (`cli/cert.go`): `flynn cert letsencrypt <domain>...` (provision) plus `--status`, `--revoke`, `--list`, `--config` (with `--enabled`, `--email`, `--ca-url`, `--challenge`, `--dns-provider`, `--dns-config`).
+- [x] **Tests**: `pkg/autocert` 7 passed (incl. new `TestManagerRevoke`); `controller` ACME suite 7 passed (`go test -vet=off ./controller/ -run TestACME`). CLI dispatch smoke-tested (usage, missing-domain, status/revoke/list/config branches). Full repo `go build ./...` clean.
+
+### Remaining Work
+- [ ] Route binding: `flynn route update <id> -c cert` so a provisioned ACME cert can be attached to an existing HTTP route (router currently serves certs from its own store; needs a dependency on controller ACME endpoint or a periodic sync).
+- [ ] Data-layer integration tests with PostgreSQL (following `controller/data/migrate_test.go` pattern) for `ACMEStore` CRUD.
+- [ ] End-to-end validation on a live cluster against the public Let's Encrypt (staging) endpoint.
+- [ ] `handler.Headers` wiring on the controller API for strict TLS/SNI (cert must be served by router, not flynn-host).
+- [ ] Push `feat/letsencrypt` branches (flynn submodule + parent) and open PR referencing issue #12.
+
