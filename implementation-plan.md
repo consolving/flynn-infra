@@ -1318,7 +1318,7 @@ Also, clear the browser cache/hard-reload once: an old service worker or autofil
 
 Implementing issue #12: integrate `pkg/autocert` (lego v4-based ACME manager, foundation commit `6da767db`) into the controller so apps can obtain/revoke Let's Encrypt certificates via HTTP-01 and DNS-01 challenges, plus a CLI interface.
 
-**Branch**: `feat/letsencrypt` (flynn submodule HEAD `19ac47ad`, parent bump `ed54264`)
+**Branch**: `feat/letsencrypt` (flynn submodule HEAD `d5c18ff`, parent bump `f46751f`)
 
 ### Status (2026-09-05)
 - [x] **Controller API** (`controller/acme.go`): `POST /certs/letsencrypt` (provision), `GET /certs/letsencrypt` (list), `GET|DELETE /certs/letsencrypt/:domain` (status/revoke), `GET|PUT /certs/letsencrypt/config` (ACME config). Revocation deletes storage only after successful ACME revocation. `acmeObtainMtx` serializes obtain/renew/revoke to avoid duplicate ACME orders.
@@ -1328,12 +1328,11 @@ Implementing issue #12: integrate `pkg/autocert` (lego v4-based ACME manager, fo
 - [x] **Renewal**: 24h loop calling `Manager.RenewDue()`; also exported `Revoke` + `HTTP01Provider()` from `pkg/autocert`.
 - [x] **Client** (`controller/client`): `ProvisionACMECert`, `ACMECertList`, `GetACMECert`, `RevokeACMECert`, `GetACMEConfig`, `UpdateACMEConfig`.
 - [x] **CLI** (`cli/cert.go`): `flynn cert letsencrypt <domain>...` (provision) plus `--status`, `--revoke`, `--list`, `--config` (with `--enabled`, `--email`, `--ca-url`, `--challenge`, `--dns-provider`, `--dns-config`).
-- [x] **Route binding (snapshot)**: `flynn route update <id> --acme <domain>` (`cli/route.go`) fetches the ACME cert from the controller and sets it on the route as PEM (LegacyTLSCert/Key); mutually exclusive with `-c/-k`, validation fails fast before any network call. Works for the `http` route type only.
-- [x] **Tests**: `pkg/autocert` 7 passed (incl. new `TestManagerRevoke`); `controller` ACME suite 7 passed (`go test -vet=off ./controller/ -run TestACME`). CLI dispatch smoke-tested (usage, missing-domain, status/revoke/list/config branches, `route update --acme` parse + conflict guard). Full repo `go build ./...` clean.
+- [x] **Route binding (snapshot + rotation)**: `flynn route update <id> --acme <domain>` (`cli/route.go`) fetches the ACME cert from the controller and sets it on the route as PEM (LegacyTLSCert/Key) while also storing `acme_domain` on the route; on ACME provision/renewal, `controller/data/route.go` `SyncACMECert` automatically updates bound routes so the router serves the new certificate without a manual re-run. Mutually exclusive with `-c/-k` on update. Works for the `http` route type only.
+- [x] **Route ACME domain tracking** (migration 51): `acme_domain` column added to `http_routes`; tracked in `router/types` and the route JSON schema.
+- [x] **Tests**: `pkg/autocert` 7 passed; `controller` ACME suite 7 passed (`go test -vet=off ./controller/ -run TestACME`); `controller/data/acme_test.go` integration tests added for `ACMEStore` CRUD and `SyncACMECert` route rotation (compile-checked; require PostgreSQL to run). Full repo `go build ./...` clean.
 
 ### Remaining Work
-- [ ] Live cert rotation to the router: the snapshot approach re-quires re-running `flynn route update --acme <domain>` after each renewal; a periodic sync or router-side cert source (domain reference) would automate rotation.
-- [ ] Data-layer integration tests with PostgreSQL (following `controller/data/migrate_test.go` pattern) for `ACMEStore` CRUD.
 - [ ] End-to-end validation on a live cluster against the public Let's Encrypt (staging) endpoint.
 - [ ] `handler.Headers` wiring on the controller API for strict TLS/SNI (cert must be served by router, not flynn-host).
 - [ ] Open a PR for `feat/letsencrypt` referencing issue #12.
