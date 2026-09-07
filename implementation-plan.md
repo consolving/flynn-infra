@@ -1330,10 +1330,10 @@ Implementing issue #12: integrate `pkg/autocert` (lego v4-based ACME manager, fo
 - [x] **CLI** (`cli/cert.go`): `flynn cert letsencrypt <domain>...` (provision) plus `--status`, `--revoke`, `--list`, `--config` (with `--enabled`, `--email`, `--ca-url`, `--challenge`, `--dns-provider`, `--dns-config`).
 - [x] **Route binding (snapshot + rotation)**: `flynn route update <id> --acme <domain>` (`cli/route.go`) fetches the ACME cert from the controller and sets it on the route as PEM (LegacyTLSCert/Key) while also storing `acme_domain` on the route; on ACME provision/renewal, `controller/data/route.go` `SyncACMECert` automatically updates bound routes so the router serves the new certificate without a manual re-run. Mutually exclusive with `-c/-k` on update. Works for the `http` route type only.
 - [x] **Route ACME domain tracking** (migration 51): `acme_domain` column added to `http_routes`; tracked in `router/types` and the route JSON schema.
-- [x] **Tests**: `pkg/autocert` 7 passed; `controller` ACME suite 7 passed (`go test -vet=off ./controller/ -run TestACME`); `controller/data/acme_test.go` integration tests added for `ACMEStore` CRUD and `SyncACMECert` route rotation (compile-checked; require PostgreSQL to run). Full repo `go build ./...` clean.
+- [x] **Tests**: `pkg/autocert` 9 passed, incl. two live ACME integration tests against Pebble/Let's Encrypt staging (`ACME_PEBBLE_TEST=1` HTTP-01 and `ACME_LETSENCRYPT_STAGING_TEST=1` DNS-01 against `acme-staging-v02`, the latter validating the AutoDNS DNS-01 provider end-to-end with real TXT record propagation); `controller` ACME suite 7 passed (`go test -vet=off ./controller/ -run TestACME`); `controller/data/acme_test.go` integration tests added for `ACMEStore` CRUD and `SyncACMECert` route rotation (compile-checked; require PostgreSQL to run). Full repo `go build ./...` clean.
 
 ### Remaining Work
-- [ ] End-to-end validation on a live cluster against the public Let's Encrypt (staging) endpoint.
+- [ ] End-to-end validation on a live Flynn cluster (controller API + CLI + router binding against the public Let's Encrypt endpoint).
 - [ ] `handler.Headers` wiring on the controller API for strict TLS/SNI (cert must be served by router, not flynn-host).
 - [ ] Open a PR for `feat/letsencrypt` referencing issue #12.
 
