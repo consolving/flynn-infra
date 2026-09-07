@@ -1362,3 +1362,30 @@ Implementing issue #12: integrate `pkg/autocert` (lego v4-based ACME manager, fo
 - [ ] Open a PR for `feat/letsencrypt` referencing issue #12.
 - [ ] Fix dashboard crashloop (`dashboard/api.go:49` panic) introduced with the bootstrap dashboard app.
 
+
+## DNS resolution fix for hello.flynn.lab.p22.de
+- Identified that local Pi-hole (192.168.168.50) was serving cached NXDOMAIN (NOERROR, empty ANSWER, p22.de SOA in AUTHORITY) with TTL ~85108 s remaining (seeded ~15:35 CEST 2026-09-07).
+- Flushed Pi-hole FTL DNS cache via  (using session cookie from  and Enpass password for 'Pi-hole' entry).
+- Verified resolution: 
+; <<>> DiG 9.20.26-1~deb13u1-Debian <<>> @192.168.168.50 hello.flynn.lab.p22.de
+; (1 server found)
+;; global options: +cmd
+;; Got answer:
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 36171
+;; flags: qr aa rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 1
+
+;; OPT PSEUDOSECTION:
+; EDNS: version: 0, flags:; udp: 1232
+;; QUESTION SECTION:
+;hello.flynn.lab.p22.de.		IN	A
+
+;; ANSWER SECTION:
+hello.flynn.lab.p22.de.	0	IN	A	192.168.168.87
+
+;; Query time: 2 msec
+;; SERVER: 192.168.168.50#53(192.168.168.50) (UDP)
+;; WHEN: Mon Sep 07 20:23:17 CEST 2026
+;; MSG SIZE  rcvd: 67 returns  (AA flag).
+- Verified HTTPS endpoint:  returns HTTP 200 with valid Let's Encrypt certificate (serial 06BA6AD7...).
+- Verified dashboard app:  returns HTTP 200 (indicating TLS handshake success and asset loading).
+- All changes committed and pushed: main repo  (submodule bumps and bootstrap manifest update), flynn submodule  (v20260907.1), tuf-repo submodule  (v20260907.1).
