@@ -1479,3 +1479,15 @@ Added certificate status visibility to the Routes section of each app in the Fly
 - CORS preflight/response on `/config` from the p22 origin → `access-control-allow-origin: https://dashboard.flynn.lab.p22.de`; CSP `connect-src` includes it.
 
 **Remaining TODO**: `INTERFACE_URL_DYNAMIC` is only set on the dashboard release; the full-rebuild path (bootstrap manifest) still needs the origin-agnostic URL handling documented/set, and the ACME `ACME_*` env + p22.de routes should move into the bootstrap manifest (see p22.de TLS Recovery section).
+
+### installcert loop on p22.de (2026-09-08)
+
+**Symptom**: `http://dashboard.flynn.lab.p22.de/installcert` was still served despite the valid LE wildcard for `*.flynn.lab.p22.de`.
+
+**Root cause** (client slice `main.js`): on an http page `__isCertInstalled()` pings `https://controller.<default_route_domain>/ping`. The dashboard release env still used the bootstrap defaults (`DEFAULT_ROUTE_DOMAIN=demo.localflynn.com`, `CONTROLLER_DOMAIN=controller.demo.localflynn.com`), so the ping went to `controller.demo.localflynn.com`, which terminates TLS with the **ephemeral self-signed Flynn CA**. The browser refuses the untrusted cert → XHR status 0 → fallback `http://controller.demo.localflynn.com/ping` returns 200 → dispatches `HTTPS_CERT_MISSING` → `installcert`. On direct https access the https ping also fails → `CONTROLLER_UNREACHABLE_FROM_HTTPS` bounces back to http first. Also: **no route existed for `controller.flynn.lab.p22.de`** at all (router aborts TLS with `internal_error` for that SNI), so it could never have been the ping target.
+
+**Fix** (runtime via controller API, no code):
+1. Created route `http/0b5df2e4-…` on the controller app: `controller.flynn.lab.p22.de` → service `controller`, `acme_domain=*.flynn.lab.p22.de`, cert = LE wildcard (reused cert id `4cf952e2…`). Now `https://controller.flynn.lab.p22.de/ping` → 200 with the trusted LE chain (verified via `openssl s_client`).
+2. Cloned the dashboard release with `DEFAULT_ROUTE_DOMAIN=flynn.lab.p22.de`, `CONTROLLER_DOMAIN=controller.flynn.lab.p22.de` → released `f92f35bf-…`, deployed. `/config` now reports p22 endpoints; the client ping hits the trusted controller host → 200 → the http page auto-redirects to https and the SPA loads with **no installcert**.
+
+**Durability**: the whole p22.de routing layer + dashboard env is now captured idempotently in `vagrant/configure-p22-domain.sh` (env-driven, no secrets baked in) so a node1 rebuild can re-apply it in one step. Runtime API notes for future ops: controller API is **not** under `/v1/` (paths are `/apps`, `/releases`, `/routes`, `/certs/letsencrypt/config`, …); the ACME cert object uses lowercase `cert`/`key` fields; the `*.` wildcard in `/certs/letsencrypt/domains/*.flynn.lab.p22.de` must be URL-encoded (`%2A`); route creation body is `{"type":"http","service":...,"domain":...,"path":"/","acme_domain":...,"certificate":{"cert":...,"key":...}}`.
