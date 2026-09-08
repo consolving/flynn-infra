@@ -41,7 +41,7 @@ NODE_IP_START   = 11
 
 # Flynn settings
 CLUSTER_DOMAIN  = ENV["CLUSTER_DOMAIN"] || "demo.localflynn.com"
-FLYNN_REPO_URL  = ENV["FLYNN_REPO_URL"] || "https://consolving.github.io/flynn-tuf-repo/repository"
+FLYNN_REPO_URL  = ENV["FLYNN_REPO_URL"] || "https://consolving.github.io/flynn-tuf-repo/repository/"
 AUTO_BOOTSTRAP  = ENV["AUTO_BOOTSTRAP"] != "false"  # set to "false" to skip bootstrap
 
 # Path to a locally-built flynn-host binary (for testing patches before TUF republish).
@@ -169,6 +169,7 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
 
           echo "==> All #{NUM_NODES} peers are online. Running bootstrap..."
           CLUSTER_DOMAIN="#{CLUSTER_DOMAIN}" \\
+          FLYNN_VERSION=v20260907.2 \\
           flynn-host bootstrap /etc/flynn/bootstrap-manifest.json \\
             --min-hosts=#{NUM_NODES} \\
             --peer-ips=#{NODE_IPS.join(",")} \\
