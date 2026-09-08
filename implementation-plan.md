@@ -1389,3 +1389,38 @@ hello.flynn.lab.p22.de.	0	IN	A	192.168.168.87
 - Verified HTTPS endpoint:  returns HTTP 200 with valid Let's Encrypt certificate (serial 06BA6AD7...).
 - Verified dashboard app:  returns HTTP 200 (indicating TLS handshake success and asset loading).
 - All changes committed and pushed: main repo  (submodule bumps and bootstrap manifest update), flynn submodule  (v20260907.1), tuf-repo submodule  (v20260907.1).
+
+## Certificate Details in Dashboard (v20260907.2)
+
+### Feature: Application Certificate Details in Dashboard
+
+Added certificate status visibility to the Routes section of each app in the Flynn dashboard.
+
+**Backend Changes** (Go controller):
+- **`controller/utils/utils.go`**: Added `ParseCertificateDetails` function that parses a PEM-encoded certificate and extracts:
+  - Subject
+  - Issuer
+  - Valid From (NotBefore)
+  - Valid Until (NotAfter)
+  - Serial Number
+  - DNS Names (SANs)
+- Added `ParseCertificateDetailsFromRoute` helper to extract certificate details from a route if present
+- **`controller/routes.go`**: Created `RouteWithCert` wrapper struct embedding `*router.Route` with `CertificateDetails` field
+- Modified `GetRoute`, `GetRouteList`, and `GetAppRouteList` handlers to return `RouteWithCert` with parsed certificate details
+
+**Frontend Changes** (React Dashboard):
+- **`dashboard/app/lib/javascripts/dashboard/views/app-routes.js.jsx`**: Added certificate details display in the Routes section
+- Added `formatDate` helper for human-readable dates
+- Modified route list rendering to display certificate details when available:
+  - Subject
+  - Issuer
+  - Valid From / Valid Until dates
+  - Serial Number
+  - DNS Names (SANs)
+
+**Verification**:
+- Controller builds successfully (`go build ./controller`)
+- Dashboard server builds successfully (`go build ./dashboard`)
+- The API now returns certificate details in the route responses
+
+**Release**: Published as v20260907.2 to TUF repository (`https://consolving.github.io/flynn-tuf-repo`) and deployed to the test cluster.
