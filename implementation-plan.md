@@ -1354,7 +1354,7 @@ Implementing issue #12: integrate `pkg/autocert` (lego v4-based ACME manager, fo
 ### Remaining Work
 - [x] End-to-end validation on a live Flynn cluster (controller API + CLI + router binding against the public Let's Encrypt endpoint) — done 2026-09-07 (DNS-01; HTTP-01 not exercised on the live cluster since the vagrant VM is not publicly reachable on port 80).
 - [x] Deploy the `syncRouteCert` fix to the live cluster via a new TUF release — done 2026-09-07 (v20260907.0).
-- [ ] Persist ACME config (bootstrap env or Postgres) so controller restarts don't wipe it.
+- [x] Persist ACME config (bootstrap env or Postgres) so controller restarts don't wipe it. — done 2026-09-08 via controller release env (`ACME_*` in release `5dbb9915`); survives controller restarts/rolls. A full cluster rebuild still loses it (bootstrap manifest does not carry `ACME_*` — remaining work below).
 - [ ] Fix router controller-stream re-resolution on failure.
 - [ ] Fix host volume-decommission events FK violations.
 - [ ] Fix `release-and-sync.sh` self-deadlock (wrapper vs. nested sync-ipfs.sh lock) and lengthen health-check tolerance.
@@ -1424,3 +1424,58 @@ Added certificate status visibility to the Routes section of each app in the Fly
 - The API now returns certificate details in the route responses
 
 **Release**: Published as v20260907.2 to TUF repository (`https://consolving.github.io/flynn-tuf-repo`) and deployed to the test cluster.
+
+## p22.de TLS Recovery After Cluster Rebuild (2026-09-08)
+
+**Symptom**: `SSL_ERROR_INTERNAL_ERROR_ALERT` for `https://dashboard.flynn.lab.p22.de` (and any other `*.flynn.lab.p22.de` URL) after the v20260907.2 full cluster rebuild.
+
+**Root causes** (three independent issues):
+1. **ACME config + certs wiped by rebuild**: ACME config was in-memory only (set via `PUT /certs/letsencrypt/config` on 2026-09-07) and the `dashboard.flynn.lab.p22.de` route is not part of the bootstrap manifest, so the rebuilt cluster had no p22.de route at all. The flynn-router aborts TLS with `internal_error` for any SNI without a matching route (by design — there is no default-cert fallback for unknown SNIs in `certForHandshake`, `router/http.go:359`).
+2. **Multi-replica in-memory ACME config**: the controller runs 2 web replicas; `PUT /certs/letsencrypt/config` only configures the replica the request hits (round-robin GET/PUT gave inconsistent results).
+3. **Router event-stream bug re-triggered** (known, see L1350): after the controller rolled (env-set deploy), all 5 routers were stuck streaming from a dead controller IP (`100.100.82.4`, `router: sync error ... i/o timeout`) and never received the new route/cert.
+
+**Recovery**:
+1. `flynn -a controller env set ACME_EMAIL=philipp@consolving.de ACME_CHALLENGE_TYPE=dns-01 ACME_DNS_PROVIDER=autodns 'ACME_DNS_CONFIG={"api_user":"WVK-Astro2","api_password":"<from Enpass domain.Pixelx>","context":"2258"}'` → release `5dbb9915`; deploy rolled all controller jobs. Env is read by `autocertConfigFromEnv()` at startup → config now survives controller restarts/rolls (partially closes the persistence TODO; a full rebuild still needs a re-set or bootstrap-manifest env).
+2. Live-PUT the same config to both controller web instances directly (per flannel IP, bypassing router round-robin) to fix a stale in-memory `http-01` state on one replica.
+3. `flynn cert letsencrypt "*.flynn.lab.p22.de"` → new LE production wildcard cert, expires 2026-12-07.
+4. `flynn -a dashboard route add http dashboard.flynn.lab.p22.de` (route `http/1e3fd678-3ae3-4c8f-8ca0-c31284901999`) + `flynn -a dashboard route update http/1e3fd678-... --acme "*.flynn.lab.p22.de"` (note: `route update` requires the **full formatted ID** `http/<uuid>`, not the bare uuid).
+5. `flynn -a router kill <all 5 router jobs>` → scheduler respawned them with fresh `controller.discoverd` resolution; streams reconnected.
+6. Verified: all 5 router nodes serve the LE wildcard chain (`CN=*.flynn.lab.p22.de` ← `YR1` ← `ISRG Root X1`); `https://dashboard.flynn.lab.p22.de/` and `/apps` → 200.
+7. Bound additional app routes to the wildcard cert (same `route add` + `route update --acme` flow): `example-node.flynn.lab.p22.de` (200), `status.flynn.lab.p22.de` (200), `example-http.flynn.lab.p22.de` (TLS OK; HTTP 503 because the app has no web jobs yet — it was created but never pushed).
+
+**Notes / anomalies**:
+- Deploy-created controller webs at 12:34 UTC briefly served a stale in-memory `http-01` ACME config despite correct `ACME_CHALLENGE_TYPE=dns-01` env (verified in `/proc/<pid>/environ`); a killed-and-respawned instance read the env correctly (`dns-01`). Suspected double-deploy race (setEnv's `DeployAppRelease` + subsequent release apply). Fixed via live PUT. Watch on the next controller deploy.
+- `flynn -a router kill node1-...` fails with `EOF` (it kills the router serving the CLI's own request) but the job is killed+respawned anyway — cosmetic.
+- Remaining TODO: carry `ACME_*` env + the dashboard p22.de route in the bootstrap manifest so a full rebuild recovers automatically.
+
+### Transient dashboard 503 after route/cert changes (2026-09-08, observed)
+- User saw the router's built-in "Service Unavailable / try again in a few minutes" page on `dashboard.flynn.lab.p22.de` right after the ACME recovery. Root cause is the router's `no backends → 503` mechanism (`router/proxy/transport.go` `errNoBackends`, `router/proxy/reverseproxy.go` serves the 503 page). When a route is (re)added or its certificate updated, the router briefly holds the route with an empty backend set until the `dashboard-web` service backends (re)register — during that window every request to that domain returns 503. It self-recovers within seconds once backends are registered (verified: 6/6 stable 200, 2 healthy backends).
+- This is cosmetic/transient, not a TLS or cert problem. A persistent 503 would instead mean: route synced but service has no backends registered (crashlooping app, or stale router — check `flynn -a router log` for `no backends` / `sync error`).
+
+### example-http pushed (2026-09-08)
+- `git push flynn main` of `/tmp/opencode/example-http` (Go 1.6.4 buildpack, Procfile `web` + `another-web`) → build OK, slug 2.176 MiB, initial release scaled to `web=1`, web job `node4-84a7b93a-...` up. `https://example-http.flynn.lab.p22.de/` → 200 (`ok`). Previously it existed only as an app record with zero jobs (hence the earlier 503 on that URL).
+
+### Dashboard origin-aware fix + layer naming bug (2026-09-08)
+
+**Symptom**: after the TLS recovery the dashboard SPA still broke on `dashboard.flynn.lab.p22.de`. The SPA loaded `window.DashboardConfig.API_SERVER`, which the dashboard API injected as the configured `URL` (`https://dashboard.demo.localflynn.com`), then fetched `/config` **cross-origin** from the demo domain. The dashboard's CORS handler (`Dashboard API CorsHandler`, `dashboard/api.go`) only allowed the demo origin and the CSP `connect-src` (`dashboard/api.go` ContentSecurityHandler) didn't include the p22 origin → the browser blocked the config fetch.
+
+**Fix (commit `61136f6e`, branch `feat/letsencrypt`)**: make the dashboard origin-aware, disabled by default, enabled via `INTERFACE_URL_DYNAMIC=true`:
+- `dashboard/config.go`: new `InterfaceURLDynamic` flag.
+- `dashboard/api.go`: `requestScheme()` honors `X-Forwarded-Proto`; `originForRequest()` returns `scheme://<request Host>` when dynamic; `CorsHandler` additionally allows that origin (defensive copy of `allowedOrigins`); `ContentSecurityHandler` appends it to `connect-src`; `ServeDashboardJs` caches the raw JS bundle once and injects `window.DashboardConfig` with `ApiServer: originForRequest(req)` **per request**.
+- Tests: `dashboard/api_origin_test.go` (4 tests passing). The pre-existing `TestUserSessionForm` failure is unrelated (fails identically without these changes).
+
+**Deploy** (built locally, Go-only — `bindata.go` keeps frontend assets in the repo):
+1. Built `/tmp/opencode/flynn-dashboard-new`, created a new squashfs layer, placed it in `flynn-tuf-repo/repository/targets/` (served by the local layer-proxy at 192.168.121.1:443 as `https://dl.consolving.net/{id}.squashfs`), and created artifact + release via `POST /artifacts` / `POST /releases` (controller internal API, Basic auth).
+
+**Layer naming bug (root cause of repeated `verify: expected ... but got ...` deploy failures)**:
+- First deploy failed on every host with: `error getting squashfs layer from https://dl.consolving.net/e1db81…squashfs: verify: expected sha512_256 hash "e1db81…" but got "b5b882c9…"`.
+- The proxy AND curl both returned what looked like the right bytes — because the layer file was **misnamed**: I had taken the first 64 hex chars of the **full sha512** (`e1db81…d3019…`) as the layer ID instead of the **sha512_256** (`b5b882c9…`). Full-sha512 checks masked it; the host verifier hashes sha512_256 and correctly rejected.
+- Fix: rename the target to `{full_sha512}.{sha512_256}.squashfs` (`.b5b882c9…squashfs`), correct `manifest.json`, create a **new artifact with a distinct URI** (artifacts are deduped by `type+uri` — same URI silently returns the old artifact!), new release, redeploy.
+- Deploy API notes: `POST /apps/:app/deploy` body is `{"id": "<release_id>"}` (a `ct.Release`); old release is auto-derived from the app's current release; `POST /releases` requires `app_id` in the body; artifact POST dedupes on `(type, uri)`.
+
+**Result**: release `30a519e2-…` deployed (jobs `node5-f7e23edf`, `node3-d6df8127` up). Verified:
+- `https://dashboard.flynn.lab.p22.de/assets/dashboard-….js` → `window.DashboardConfig.API_SERVER = "https://dashboard.flynn.lab.p22.de"` (same-origin).
+- `https://dashboard.demo.localflynn.com/assets/dashboard-….js` → `API_SERVER = "https://dashboard.demo.localflynn.com"` (backward compatible).
+- CORS preflight/response on `/config` from the p22 origin → `access-control-allow-origin: https://dashboard.flynn.lab.p22.de`; CSP `connect-src` includes it.
+
+**Remaining TODO**: `INTERFACE_URL_DYNAMIC` is only set on the dashboard release; the full-rebuild path (bootstrap manifest) still needs the origin-agnostic URL handling documented/set, and the ACME `ACME_*` env + p22.de routes should move into the bootstrap manifest (see p22.de TLS Recovery section).
