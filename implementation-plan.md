@@ -1314,3 +1314,253 @@ Also, clear the browser cache/hard-reload once: an old service worker or autofil
 - `controller/data/route.go:426` uses `crypto/md5` for event deduplication only; non-cryptographic, but should be documented or migrated to SHA-256.
 - `appliance/postgresql/process.go:1007` sets `password_encryption = md5`; evaluate moving to `scram-sha-256` if client compatibility allows.
 
+## ACME / Let's Encrypt Certificate Management (Issue #12)
+
+Implementing issue #12: integrate `pkg/autocert` (lego v4-based ACME manager, foundation commit `6da767db`) into the controller so apps can obtain/revoke Let's Encrypt certificates via HTTP-01 and DNS-01 challenges, plus a CLI interface.
+
+**Branch**: `feat/letsencrypt` (flynn submodule HEAD `d5c18ff`, parent bump `f46751f`)
+
+### Status (2026-09-05)
+- [x] **Controller API** (`controller/acme.go`): `POST /certs/letsencrypt` (provision), `GET /certs/letsencrypt` (list), `GET|DELETE /certs/letsencrypt/:domain` (status/revoke), `GET|PUT /certs/letsencrypt/config` (ACME config). Revocation deletes storage only after successful ACME revocation. `acmeObtainMtx` serializes obtain/renew/revoke to avoid duplicate ACME orders.
+- [x] **Challenge route**: `/.well-known/acme-challenge/*token` mounted on the unauthenticated HTTP server path (alongside `/ca-cert`) so Let's Encrypt can reach the HTTP-01 responder without credentials.
+- [x] **Persistence** (migration 50): `acme_accounts` (email UNIQUE, private_key, registration) and `acme_certificates` (domain, domains text[], cert, key, cert_url, account_email, expires_at, deleted_at, partial unique index on domain WHERE deleted_at IS NULL). `controller/data/acme.go` implements `autocert.Store` over `pkg/postgres` prepared statements.
+- [x] **Config**: boot-time env vars `ACME_EMAIL`, `ACME_CA_URL`, `ACME_CHALLENGE_TYPE`, `ACME_DNS_PROVIDER`, `ACME_DNS_CONFIG`; runtime updates via `PUT /certs/letsencrypt/config` swap the lego Manager in place.
+- [x] **Renewal**: 24h loop calling `Manager.RenewDue()`; also exported `Revoke` + `HTTP01Provider()` from `pkg/autocert`.
+- [x] **Client** (`controller/client`): `ProvisionACMECert`, `ACMECertList`, `GetACMECert`, `RevokeACMECert`, `GetACMEConfig`, `UpdateACMEConfig`.
+- [x] **CLI** (`cli/cert.go`): `flynn cert letsencrypt <domain>...` (provision) plus `--status`, `--revoke`, `--list`, `--config` (with `--enabled`, `--email`, `--ca-url`, `--challenge`, `--dns-provider`, `--dns-config`).
+- [x] **Route binding (snapshot + rotation)**: `flynn route update <id> --acme <domain>` (`cli/route.go`) fetches the ACME cert from the controller and sets it on the route as PEM (LegacyTLSCert/Key) while also storing `acme_domain` on the route; on ACME provision/renewal, `controller/data/route.go` `SyncACMECert` automatically updates bound routes so the router serves the new certificate without a manual re-run. Mutually exclusive with `-c/-k` on update. Works for the `http` route type only.
+- [x] **Route ACME domain tracking** (migration 51): `acme_domain` column added to `http_routes`; tracked in `router/types` and the route JSON schema.
+- [x] **Tests**: `pkg/autocert` 9 passed, incl. two live ACME integration tests against Pebble/Let's Encrypt staging (`ACME_PEBBLE_TEST=1` HTTP-01 and `ACME_LETSENCRYPT_STAGING_TEST=1` DNS-01 against `acme-staging-v02`, the latter validating the AutoDNS DNS-01 provider end-to-end with real TXT record propagation); `controller` ACME suite 7 passed (`go test -vet=off ./controller/ -run TestACME`); `controller/data/acme_test.go` integration tests added for `ACMEStore` CRUD and `SyncACMECert` route rotation (compile-checked; require PostgreSQL to run). Full repo `go build ./...` clean.
+
+### Live Cluster Validation (2026-09-07, vagrant `node1` cluster)
+- [x] **End-to-end DNS-01 against production Let's Encrypt**: set `PUT /certs/letsencrypt/config` to `challenge_type=dns-01`, `dns_provider=autodns` (credentials via Enpass `domain.Pixelx`, context 2258), then `POST /certs/letsencrypt {"domains":["*.flynn.lab.p22.de"]}`. The controller itself registered the account, created the TXT record via AutoDNS, passed propagation checks and finalized the order — issuer `C=US, O=Let's Encrypt, CN=YR1`, expires 2026-12-06. No external ACME tooling involved.
+- [x] **Router serving production cert**: dashboard route (`dashboard.flynn.lab.p22.de`, `acme_domain=*.flynn.lab.p22.de`) bound to the ACME cert; `openssl s_client` against the router (192.168.50.11:443) shows the LE production chain (3 certs) and plain `curl https://dashboard.flynn.lab.p22.de/` validates against the system CA bundle (backend 503 is a separate dashboard crashloop at `dashboard/api.go:49`, pre-existing).
+- [x] **Bug found + fixed — route sync event collision**: provisioning succeeded but storing the cert returned 500 (`events_unique_id_idx` SQLSTATE 23505). Root cause: `syncRouteCert` (`controller/data/route.go`) reuses the route's stale `UpdatedAt` for the event dedupe hash (unlike the normal update path, which scans back a fresh `updated_at` from `http_route_update`), and `CreateEvent` has no `ON CONFLICT`, so the ACME sync event collided with the earlier `route update --acme` event. Fix: refresh `route.UpdatedAt = time.Now()` before `createEvent` in `syncRouteCert` so the router always gets a distinct route event. **The fix must be deployed before the 24h renewal loop matters (cert renews ~2026-11-06)** — until then, re-binding after renewal needs a manual `route update --acme`.
+- [x] **`controller/data/acme_test.go` now actually runs**: previously "compile-checked" only — `setupTestDB` never prepared statements, so named queries failed with syntax errors, and timestamptz µs-truncation broke `ExpiresAt` equality. Added `setupACMETestDB` (migrate to 51, reconnect with `AfterConnect: PrepareStatements`) and truncated test timestamps. All 4 tests pass; without the `route.go` fix, `TestACMECertSyncsBoundRoutes` fails with the exact production 23505 error. Test DB: `docker run -d --name flynn-pg-test -e POSTGRES_HOST_AUTH_METHOD=trust -v /var/run/postgresql:/var/run/postgresql postgres:15-alpine` + `CREATE ROLE root SUPERUSER`, run with `PGHOST=/var/run/postgresql`.
+
+### Deployment of the Fix (2026-09-07, release v20260907.0)
+- [x] **TUF release v20260907.0**: `script/bootstrap-build --version v20260907.0` + `go run script/export-tuf/main.go --tuf-dir=.../flynn-tuf-repo --build-dir=.../flynn/build --source-dir=.../flynn --version=v20260907.0 --layer-cache=.../flynn/build/layer-cache --skip-base-layers`. Package-layer disk cache in `layer-cache/pkg/` made `--skip-base-layers` safe (noble base untouched). Committed in `flynn-tuf-repo@46f3e32`, pushed to GitHub + GitLab mirror.
+- [x] **IPFS sync to host1/host2**: 21 new squashfs layers (218 MB; 28 exported, 7 base layers unchanged) rsynced to `/opt/flynn-tuf-dl/release-v20260907-layers`. **Gotchas hit**: (1) `release-and-sync.sh` self-deadlocks — the wrapper holds the flock on fd 9 while invoking `sync-ipfs.sh`, which re-opens the same lock file with a *new* fd and blocks on itself (killing the wrapper's sleep then releasing the lock exposed the nested `flock -w 300 9` children; the fix is to run `sync-ipfs.sh` standalone and do the host2 steps manually, or drop the lock from the wrapper); (2) `sync-ipfs.sh` refreshes TUF metadata from host1's git clone (`git fetch origin` from GitHub), so the new release commit **must be pushed to GitHub first** — the first sync captured a CID with v20260906.2 metadata (targets v848), requiring a re-sync; (3) the health-check (5 attempts × 5 s) starts before the restarted `ipfs_node` container finishes warming up — promotion failed but compose/MFS were already updated, so `.ipfs-cid` was promoted manually after the gateway recovered. Final CID `bafybeidolzhdbigla33tgriqmxbfjiugb336ndx3qcn5jlul37knxo5spu` (targets v934), host2 pinned + MFS + compose updated. Note: the unhashed `repository/targets/channels/stable` file is stale since v20260904.0 (clients use the hashed `channels/{sha512}.stable` target, which correctly serves v20260907.0; cosmetic only).
+- [x] **In-place controller update** (no re-bootstrap): `POST /artifacts` with the v20260907.0 controller artifact from `flynn/build/manifests/bootstrap-manifest.json`, `POST /releases` (clone current release with the new artifact), `PUT /apps/controller/release`, then `POST /apps/controller/deploy` — note `PUT .../release` alone does not roll jobs: the subsequent deploy was initially a no-op (old==new release), fixed by reverting the pointer to the old release first, then deploying. Scheduler rolled web/scheduler/worker one-by-one; ~90 s total.
+- [x] **Re-provision through the fixed path**: re-set the ACME config (in-memory only, lost on controller restart — see below) and `POST /certs/letsencrypt` → new cert (serial `06BA6AD7…`, issuer YR2), route `certificate` **auto-updated to `69cf94ed-…` with no 500** — the event-collision fix works on the live cluster.
+- [x] **All 5 router nodes serve the new cert** (serial 06BA6AD7) and plain `curl https://dashboard.flynn.lab.p22.de/` validates against the system CA bundle.
+
+### Issues Found During Deployment (pre-existing, worth fixing)
+- **ACME config is not persisted**: `autocertConfigFromEnv()` only reads `ACME_*` env at controller start and `UpdateACMEConfig` keeps the config in memory — a controller restart wipes any runtime-configured ACME settings. The bootstrap manifest should carry the `ACME_*` env (or the config should be stored in Postgres).
+- **Router never re-resolves controller service**: the router holds the controller event-stream IP (resolved once at startup) forever; after a controller rollout the old web job IP (`100.100.49.4`) is dead and every router logs `sync error: i/o timeout` / `no route to host` indefinitely. Workaround: `flynn -a router kill <job>` (scheduler respawns, fresh DNS lookup). Fix: reconnect logic should re-resolve `controller.discoverd` on stream failure.
+- **Host volume events violate `events_app_id_fkey`**: hosts `PUT /volumes/:id` (decommission) for orphaned volumes whose `vol.AppID` is a non-existent app UUID; `CreateEvent` inserts unconditionally → SQLSTATE 23503 spam every few seconds on the controller.
+- **`sync-ipfs.sh` / `release-and-sync.sh` lock + health-check issues** (see above).
+
+### Remaining Work
+- [x] End-to-end validation on a live Flynn cluster (controller API + CLI + router binding against the public Let's Encrypt endpoint) — done 2026-09-07 (DNS-01; HTTP-01 not exercised on the live cluster since the vagrant VM is not publicly reachable on port 80).
+- [x] Deploy the `syncRouteCert` fix to the live cluster via a new TUF release — done 2026-09-07 (v20260907.0).
+- [x] Persist ACME config (bootstrap env or Postgres) so controller restarts don't wipe it. — done 2026-09-08 via controller release env (`ACME_*` in release `5dbb9915`); survives controller restarts/rolls. A full cluster rebuild still loses it (bootstrap manifest does not carry `ACME_*` — remaining work below).
+- [ ] Fix router controller-stream re-resolution on failure.
+- [ ] Fix host volume-decommission events FK violations.
+- [ ] Fix `release-and-sync.sh` self-deadlock (wrapper vs. nested sync-ipfs.sh lock) and lengthen health-check tolerance.
+- [ ] `handler.Headers` wiring on the controller API for strict TLS/SNI (cert must be served by router, not flynn-host).
+- [ ] Open a PR for `feat/letsencrypt` referencing issue #12.
+- [ ] Fix dashboard crashloop (`dashboard/api.go:49` panic) introduced with the bootstrap dashboard app.
+
+
+## DNS resolution fix for hello.flynn.lab.p22.de
+- Identified that local Pi-hole (192.168.168.50) was serving cached NXDOMAIN (NOERROR, empty ANSWER, p22.de SOA in AUTHORITY) with TTL ~85108 s remaining (seeded ~15:35 CEST 2026-09-07).
+- Flushed Pi-hole FTL DNS cache via  (using session cookie from  and Enpass password for 'Pi-hole' entry).
+- Verified resolution: 
+; <<>> DiG 9.20.26-1~deb13u1-Debian <<>> @192.168.168.50 hello.flynn.lab.p22.de
+; (1 server found)
+;; global options: +cmd
+;; Got answer:
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 36171
+;; flags: qr aa rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 1
+
+;; OPT PSEUDOSECTION:
+; EDNS: version: 0, flags:; udp: 1232
+;; QUESTION SECTION:
+;hello.flynn.lab.p22.de.		IN	A
+
+;; ANSWER SECTION:
+hello.flynn.lab.p22.de.	0	IN	A	192.168.168.87
+
+;; Query time: 2 msec
+;; SERVER: 192.168.168.50#53(192.168.168.50) (UDP)
+;; WHEN: Mon Sep 07 20:23:17 CEST 2026
+;; MSG SIZE  rcvd: 67 returns  (AA flag).
+- Verified HTTPS endpoint:  returns HTTP 200 with valid Let's Encrypt certificate (serial 06BA6AD7...).
+- Verified dashboard app:  returns HTTP 200 (indicating TLS handshake success and asset loading).
+- All changes committed and pushed: main repo  (submodule bumps and bootstrap manifest update), flynn submodule  (v20260907.1), tuf-repo submodule  (v20260907.1).
+
+## Certificate Details in Dashboard (v20260907.2)
+
+### Feature: Application Certificate Details in Dashboard
+
+Added certificate status visibility to the Routes section of each app in the Flynn dashboard.
+
+**Backend Changes** (Go controller):
+- **`controller/utils/utils.go`**: Added `ParseCertificateDetails` function that parses a PEM-encoded certificate and extracts:
+  - Subject
+  - Issuer
+  - Valid From (NotBefore)
+  - Valid Until (NotAfter)
+  - Serial Number
+  - DNS Names (SANs)
+- Added `ParseCertificateDetailsFromRoute` helper to extract certificate details from a route if present
+- **`controller/routes.go`**: Created `RouteWithCert` wrapper struct embedding `*router.Route` with `CertificateDetails` field
+- Modified `GetRoute`, `GetRouteList`, and `GetAppRouteList` handlers to return `RouteWithCert` with parsed certificate details
+
+**Frontend Changes** (React Dashboard):
+- **`dashboard/app/lib/javascripts/dashboard/views/app-routes.js.jsx`**: Added certificate details display in the Routes section
+- Added `formatDate` helper for human-readable dates
+- Modified route list rendering to display certificate details when available:
+  - Subject
+  - Issuer
+  - Valid From / Valid Until dates
+  - Serial Number
+  - DNS Names (SANs)
+
+**Verification**:
+- Controller builds successfully (`go build ./controller`)
+- Dashboard server builds successfully (`go build ./dashboard`)
+- The API now returns certificate details in the route responses
+
+**Release**: Published as v20260907.2 to TUF repository (`https://consolving.github.io/flynn-tuf-repo`) and deployed to the test cluster.
+
+## p22.de TLS Recovery After Cluster Rebuild (2026-09-08)
+
+**Symptom**: `SSL_ERROR_INTERNAL_ERROR_ALERT` for `https://dashboard.flynn.lab.p22.de` (and any other `*.flynn.lab.p22.de` URL) after the v20260907.2 full cluster rebuild.
+
+**Root causes** (three independent issues):
+1. **ACME config + certs wiped by rebuild**: ACME config was in-memory only (set via `PUT /certs/letsencrypt/config` on 2026-09-07) and the `dashboard.flynn.lab.p22.de` route is not part of the bootstrap manifest, so the rebuilt cluster had no p22.de route at all. The flynn-router aborts TLS with `internal_error` for any SNI without a matching route (by design — there is no default-cert fallback for unknown SNIs in `certForHandshake`, `router/http.go:359`).
+2. **Multi-replica in-memory ACME config**: the controller runs 2 web replicas; `PUT /certs/letsencrypt/config` only configures the replica the request hits (round-robin GET/PUT gave inconsistent results).
+3. **Router event-stream bug re-triggered** (known, see L1350): after the controller rolled (env-set deploy), all 5 routers were stuck streaming from a dead controller IP (`100.100.82.4`, `router: sync error ... i/o timeout`) and never received the new route/cert.
+
+**Recovery**:
+1. `flynn -a controller env set ACME_EMAIL=philipp@consolving.de ACME_CHALLENGE_TYPE=dns-01 ACME_DNS_PROVIDER=autodns 'ACME_DNS_CONFIG={"api_user":"WVK-Astro2","api_password":"<from Enpass domain.Pixelx>","context":"2258"}'` → release `5dbb9915`; deploy rolled all controller jobs. Env is read by `autocertConfigFromEnv()` at startup → config now survives controller restarts/rolls (partially closes the persistence TODO; a full rebuild still needs a re-set or bootstrap-manifest env).
+2. Live-PUT the same config to both controller web instances directly (per flannel IP, bypassing router round-robin) to fix a stale in-memory `http-01` state on one replica.
+3. `flynn cert letsencrypt "*.flynn.lab.p22.de"` → new LE production wildcard cert, expires 2026-12-07.
+4. `flynn -a dashboard route add http dashboard.flynn.lab.p22.de` (route `http/1e3fd678-3ae3-4c8f-8ca0-c31284901999`) + `flynn -a dashboard route update http/1e3fd678-... --acme "*.flynn.lab.p22.de"` (note: `route update` requires the **full formatted ID** `http/<uuid>`, not the bare uuid).
+5. `flynn -a router kill <all 5 router jobs>` → scheduler respawned them with fresh `controller.discoverd` resolution; streams reconnected.
+6. Verified: all 5 router nodes serve the LE wildcard chain (`CN=*.flynn.lab.p22.de` ← `YR1` ← `ISRG Root X1`); `https://dashboard.flynn.lab.p22.de/` and `/apps` → 200.
+7. Bound additional app routes to the wildcard cert (same `route add` + `route update --acme` flow): `example-node.flynn.lab.p22.de` (200), `status.flynn.lab.p22.de` (200), `example-http.flynn.lab.p22.de` (TLS OK; HTTP 503 because the app has no web jobs yet — it was created but never pushed).
+
+**Notes / anomalies**:
+- Deploy-created controller webs at 12:34 UTC briefly served a stale in-memory `http-01` ACME config despite correct `ACME_CHALLENGE_TYPE=dns-01` env (verified in `/proc/<pid>/environ`); a killed-and-respawned instance read the env correctly (`dns-01`). Suspected double-deploy race (setEnv's `DeployAppRelease` + subsequent release apply). Fixed via live PUT. Watch on the next controller deploy.
+- `flynn -a router kill node1-...` fails with `EOF` (it kills the router serving the CLI's own request) but the job is killed+respawned anyway — cosmetic.
+- Remaining TODO: carry `ACME_*` env + the dashboard p22.de route in the bootstrap manifest so a full rebuild recovers automatically.
+
+### Transient dashboard 503 after route/cert changes (2026-09-08, observed)
+- User saw the router's built-in "Service Unavailable / try again in a few minutes" page on `dashboard.flynn.lab.p22.de` right after the ACME recovery. Root cause is the router's `no backends → 503` mechanism (`router/proxy/transport.go` `errNoBackends`, `router/proxy/reverseproxy.go` serves the 503 page). When a route is (re)added or its certificate updated, the router briefly holds the route with an empty backend set until the `dashboard-web` service backends (re)register — during that window every request to that domain returns 503. It self-recovers within seconds once backends are registered (verified: 6/6 stable 200, 2 healthy backends).
+- This is cosmetic/transient, not a TLS or cert problem. A persistent 503 would instead mean: route synced but service has no backends registered (crashlooping app, or stale router — check `flynn -a router log` for `no backends` / `sync error`).
+
+### example-http pushed (2026-09-08)
+- `git push flynn main` of `/tmp/opencode/example-http` (Go 1.6.4 buildpack, Procfile `web` + `another-web`) → build OK, slug 2.176 MiB, initial release scaled to `web=1`, web job `node4-84a7b93a-...` up. `https://example-http.flynn.lab.p22.de/` → 200 (`ok`). Previously it existed only as an app record with zero jobs (hence the earlier 503 on that URL).
+
+### Dashboard origin-aware fix + layer naming bug (2026-09-08)
+
+**Symptom**: after the TLS recovery the dashboard SPA still broke on `dashboard.flynn.lab.p22.de`. The SPA loaded `window.DashboardConfig.API_SERVER`, which the dashboard API injected as the configured `URL` (`https://dashboard.demo.localflynn.com`), then fetched `/config` **cross-origin** from the demo domain. The dashboard's CORS handler (`Dashboard API CorsHandler`, `dashboard/api.go`) only allowed the demo origin and the CSP `connect-src` (`dashboard/api.go` ContentSecurityHandler) didn't include the p22 origin → the browser blocked the config fetch.
+
+**Fix (commit `61136f6e`, branch `feat/letsencrypt`)**: make the dashboard origin-aware, disabled by default, enabled via `INTERFACE_URL_DYNAMIC=true`:
+- `dashboard/config.go`: new `InterfaceURLDynamic` flag.
+- `dashboard/api.go`: `requestScheme()` honors `X-Forwarded-Proto`; `originForRequest()` returns `scheme://<request Host>` when dynamic; `CorsHandler` additionally allows that origin (defensive copy of `allowedOrigins`); `ContentSecurityHandler` appends it to `connect-src`; `ServeDashboardJs` caches the raw JS bundle once and injects `window.DashboardConfig` with `ApiServer: originForRequest(req)` **per request**.
+- Tests: `dashboard/api_origin_test.go` (4 tests passing). The pre-existing `TestUserSessionForm` failure is unrelated (fails identically without these changes).
+
+**Deploy** (built locally, Go-only — `bindata.go` keeps frontend assets in the repo):
+1. Built `/tmp/opencode/flynn-dashboard-new`, created a new squashfs layer, placed it in `flynn-tuf-repo/repository/targets/` (served by the local layer-proxy at 192.168.121.1:443 as `https://dl.consolving.net/{id}.squashfs`), and created artifact + release via `POST /artifacts` / `POST /releases` (controller internal API, Basic auth).
+
+**Layer naming bug (root cause of repeated `verify: expected ... but got ...` deploy failures)**:
+- First deploy failed on every host with: `error getting squashfs layer from https://dl.consolving.net/e1db81…squashfs: verify: expected sha512_256 hash "e1db81…" but got "b5b882c9…"`.
+- The proxy AND curl both returned what looked like the right bytes — because the layer file was **misnamed**: I had taken the first 64 hex chars of the **full sha512** (`e1db81…d3019…`) as the layer ID instead of the **sha512_256** (`b5b882c9…`). Full-sha512 checks masked it; the host verifier hashes sha512_256 and correctly rejected.
+- Fix: rename the target to `{full_sha512}.{sha512_256}.squashfs` (`.b5b882c9…squashfs`), correct `manifest.json`, create a **new artifact with a distinct URI** (artifacts are deduped by `type+uri` — same URI silently returns the old artifact!), new release, redeploy.
+- Deploy API notes: `POST /apps/:app/deploy` body is `{"id": "<release_id>"}` (a `ct.Release`); old release is auto-derived from the app's current release; `POST /releases` requires `app_id` in the body; artifact POST dedupes on `(type, uri)`.
+
+**Result**: release `30a519e2-…` deployed (jobs `node5-f7e23edf`, `node3-d6df8127` up). Verified:
+- `https://dashboard.flynn.lab.p22.de/assets/dashboard-….js` → `window.DashboardConfig.API_SERVER = "https://dashboard.flynn.lab.p22.de"` (same-origin).
+- `https://dashboard.demo.localflynn.com/assets/dashboard-….js` → `API_SERVER = "https://dashboard.demo.localflynn.com"` (backward compatible).
+- CORS preflight/response on `/config` from the p22 origin → `access-control-allow-origin: https://dashboard.flynn.lab.p22.de`; CSP `connect-src` includes it.
+
+**Remaining TODO**: `INTERFACE_URL_DYNAMIC` is only set on the dashboard release; the full-rebuild path (bootstrap manifest) still needs the origin-agnostic URL handling documented/set, and the ACME `ACME_*` env + p22.de routes should move into the bootstrap manifest (see p22.de TLS Recovery section).
+
+### installcert loop on p22.de (2026-09-08)
+
+**Symptom**: `http://dashboard.flynn.lab.p22.de/installcert` was still served despite the valid LE wildcard for `*.flynn.lab.p22.de`.
+
+**Root cause** (client slice `main.js`): on an http page `__isCertInstalled()` pings `https://controller.<default_route_domain>/ping`. The dashboard release env still used the bootstrap defaults (`DEFAULT_ROUTE_DOMAIN=demo.localflynn.com`, `CONTROLLER_DOMAIN=controller.demo.localflynn.com`), so the ping went to `controller.demo.localflynn.com`, which terminates TLS with the **ephemeral self-signed Flynn CA**. The browser refuses the untrusted cert → XHR status 0 → fallback `http://controller.demo.localflynn.com/ping` returns 200 → dispatches `HTTPS_CERT_MISSING` → `installcert`. On direct https access the https ping also fails → `CONTROLLER_UNREACHABLE_FROM_HTTPS` bounces back to http first. Also: **no route existed for `controller.flynn.lab.p22.de`** at all (router aborts TLS with `internal_error` for that SNI), so it could never have been the ping target.
+
+**Fix** (runtime via controller API, no code):
+1. Created route `http/0b5df2e4-…` on the controller app: `controller.flynn.lab.p22.de` → service `controller`, `acme_domain=*.flynn.lab.p22.de`, cert = LE wildcard (reused cert id `4cf952e2…`). Now `https://controller.flynn.lab.p22.de/ping` → 200 with the trusted LE chain (verified via `openssl s_client`).
+2. Cloned the dashboard release with `DEFAULT_ROUTE_DOMAIN=flynn.lab.p22.de`, `CONTROLLER_DOMAIN=controller.flynn.lab.p22.de` → released `f92f35bf-…`, deployed. `/config` now reports p22 endpoints; the client ping hits the trusted controller host → 200 → the http page auto-redirects to https and the SPA loads with **no installcert**.
+
+**Durability**: the whole p22.de routing layer + dashboard env is now captured idempotently in `vagrant/configure-p22-domain.sh` (env-driven, no secrets baked in) so a node1 rebuild can re-apply it in one step. Runtime API notes for future ops: controller API is **not** under `/v1/` (paths are `/apps`, `/releases`, `/routes`, `/certs/letsencrypt/config`, …); the ACME cert object uses lowercase `cert`/`key` fields; the `*.` wildcard in `/certs/letsencrypt/domains/*.flynn.lab.p22.de` must be URL-encoded (`%2A`); route creation body is `{"type":"http","service":...,"domain":...,"path":"/","acme_domain":...,"certificate":{"cert":...,"key":...}}`.
+
+### Dashboard app-details: missing log output and certificate details (2026-09-09)
+
+**Symptom 1 — logs**: opening a process's log in the dashboard app-details view showed a single line `[undefined] undefined` instead of log output.
+
+**Root cause**: `dashboard/app/lib/javascripts/dashboard/stores/job-output.js` opens `window.EventSource(url)` where `url` includes `&key=<controller_key>` as a **query parameter**, because native `EventSource` cannot set an `Authorization` header. `controller/authorizer/authorizer.go:AuthorizeRequest` has never (in any commit in this repo) read a `key` query parameter — it only checks the `Authorization` header (Basic or Bearer) — so every browser-initiated log stream got **HTTP 401**. `job-output.js` then sets `streamError = "Failed to connect to log"` (a plain string); `command-output.js.jsx` formats each output item as `` `[${item.timestamp}] ${item.msg}` ``, and a bare string has neither field, hence the literal `[undefined] undefined`. Confirmed via `curl`: same endpoint returns HTTP 200 with real log data using Basic Auth, and 401 using `?key=`.
+
+**Symptom 2 — certificates**: the "Certificate Details" block never appeared under a route in the app-details "Routes" section, even though the controller's `GET /apps/:id/routes` correctly returns a populated `certificate_details` object (subject/issuer/validity/serial/dns_names).
+
+**Root cause**: `certificate_details` rendering in `dashboard/app/lib/javascripts/dashboard/views/app-routes.js.jsx` was added in commit `2cb62747 feat: add certificate details to dashboard routes view`, but the **deployed dashboard artifact predates that commit** — our earlier fix (previous section) only changed the dashboard release's **env vars**, never its **code artifact**. Confirmed by downloading the live JS bundle and grepping: zero occurrences of `certificate_details` in the old bundle.
+
+**Fix 1 (controller, source change)**: `controller/authorizer/authorizer.go` `AuthorizeRequest` now falls back to a `?key=` query parameter when there's no usable Basic-Auth/Bearer credential, authorizing it the same way as the Basic-Auth password (via `AuthorizeKey`). Commit `17b518ee controller: accept key as query param fallback for log SSE auth` (flynn submodule).
+
+**Fix 2 (dashboard, rebuilt artifact)**: rebuilt the dashboard from current `flynn` HEAD end-to-end:
+- `go build ./dashboard/app` → `dashboard-compile` (the asset-matrix-go compiler, vendored).
+- Ran `dashboard-compile` against `dashboard/app/lib` + `dashboard/app/vendor` to produce `build/assets/*` + `build/dashboard.html`. This required **Node.js 12.22.12** (via `asdf`) and **Python 2.7.18** (via `asdf`, built from source) — `node-sass@4.12`'s prebuilt binary only matches older Node ABI versions, and its `node-gyp` fallback needs `python2`; neither is installed by default in this environment.
+- `go-bindata -nomemcopy -nocompress -pkg main app/build/...` (matching `dashboard/img/compile.sh` exactly) to generate a real `bindata.go`, temporarily swapped in for the checked-in dev stub, then `go build ./dashboard` → `flynn-dashboard` binary with all assets embedded. Restored the stub afterward (`git checkout -- dashboard/bindata.go`) so the working tree stays clean.
+- Verified the new bundle contains `certificate_details` (cert-details feature) and the (already-present) `Failed to connect to log` string (log-stream error path, now moot given fix 1).
+
+**Deployment mechanism — `/etc/flynn/bin-overrides/`**: both the patched `flynn-controller` and rebuilt `flynn-dashboard` binaries were deployed via the existing host-level override mechanism in `host/libcontainer_backend.go` (`binOverridesDir := "/etc/flynn/bin-overrides"`): any file placed there on a host replaces the same-named file in `/bin/` inside that host's container overlay at **container creation time**, without touching the TUF-hosted squashfs artifacts. This was **not durable via a full rebuild-from-artifact path** — building/publishing new signed images through the `dl.consolving.net`/IPFS/TUF pipeline (`script/export-tuf`, `/opt/flynn-tuf-dl/release-and-sync.sh` on `host1.consolving.net:24`) was judged out of scope for two small binary patches, given the pipeline is set up for full component releases.
+- Placed identical binaries (verified via `sha256sum`) on **all 5 cluster hosts** (`192.168.50.11-.15`), not just the 2 that happened to be running the `controller`/`dashboard` jobs at the time — both are regular scaled processes (not `omni`-pinned), so the scheduler can (and did, mid-fix) reschedule a killed job onto any other host.
+- Restarted the running job(s) via `pkill -f /bin/<binary>` on the host (as root) so the scheduler creates a fresh job on some host, which mounts the override; killing rather than a graceful stop was used since the job's own container was going to be discarded anyway.
+- **Known limitation**: this override is a plain file per host, independent of the artifact/release history. A host reimage or a future full artifact-based redeploy would silently lose it. It's not currently automated into `vagrant/configure-p22-domain.sh` or any other idempotent script — a follow-up should either (a) fold `bin-overrides` provisioning into a script backed by binaries stored somewhere durable (not git, given their size: ~24 MB and ~22 MB), or (b) do the proper TUF/IPFS artifact publish for a permanent fix.
+
+**Verification**: `curl -N -H 'Accept: text/event-stream' '.../apps/<id>/log?...&key=<key>'` → HTTP 200 with real log lines (previously 401) on all 5 hosts (tested directly via each host's `100.100.x.x` discoverd address, and repeatedly via the public router to confirm both controller replicas were fixed). New dashboard bundle (`dashboard-9fd68f0ae95fb0deac2384bff329c9e4.js`) served at `https://dashboard.flynn.lab.p22.de/`, contains `certificate_details`, page loads 200, `/config` unchanged.
+
+### CRITICAL REGRESSION: `bin-overrides` broke merged-usr apps cluster-wide (2026-09-09)
+
+**Impact**: shortly after the `bin-overrides` deployment above, `example-http` (and potentially any other app using a merged-usr base image) started crash-looping — `flynn get apps/example-http/jobs` showed `state: down`, `host_error: "fork/exec /runner/init: no such file or directory"`, `restarts` climbing every ~30s (fresh job scheduled → immediate failure → backoff → repeat), with **zero successful starts** and no `example-http-web` service ever registered in discoverd. Reported by the user as "the web application seems to crash constantly."
+
+**Root cause**: `host/libcontainer_backend.go`'s bin-override code (lines ~699-719) runs `os.MkdirAll(filepath.Join(diffDir, "bin"), 0755)` **unconditionally for every container**, as soon as `/etc/flynn/bin-overrides` exists on the host (regardless of which files are in it). Ubuntu-based Flynn images use **merged-usr** (`/bin -> usr/bin` symlink; confirmed via `ls -la .../rootfs/bin` → `lrwxrwxrwx ... bin -> usr/bin`, plus `bin.usr-is-merged`/`lib.usr-is-merged`/`sbin.usr-is-merged` marker files in the layer). Creating a **real directory** at `/bin` in the overlay's upperdir shadows that lower-layer symlink for the whole merged view — overlayfs has no way to "merge into" a symlink, so the upper directory entry wins completely, and the container's `/bin` becomes just the 2 override files (`flynn-controller`, `flynn-dashboard`) instead of the full `/usr/bin` (bash, coreutils, etc.). `example-http`'s entrypoint `/runner/init` is a **Bourne-Again shell script** (`#!/bin/bash` shebang); with `/bin/bash` no longer resolvable, `execve()` returns `ENOENT` for the *interpreter*, which Go's `os/exec` reports identically to a missing target file: `fork/exec /runner/init: no such file or directory` — a well-known ambiguity in that error string that initially pointed the investigation at the wrong layer (squashfs/layer-cache corruption, loop-device exhaustion — both ruled out; the base layer's `/runner/init` file and its squashfs mount were verified intact throughout).
+
+Before this session, `/etc/flynn/bin-overrides` did not exist on any host, so this code path was always skipped (`os.ReadDir` errors on a missing dir) — meaning **this bug has always existed in `host/libcontainer_backend.go` for any base image using merged-usr**, it just had never been triggered because nothing had ever populated that directory on this cluster until today.
+
+**Immediate fix**: removed `/etc/flynn/bin-overrides` entirely from all 5 hosts (`rm -rf`). Verified `example-http`'s very next scheduled attempt started cleanly (`state: up`, no `host_error`) and `https://example-http.flynn.lab.p22.de/` returned `200 ok`. Checked all other apps (`example-node`, `status`, `taffy`, `tarreceive`, `gitreceive`) — all `up`, zero restarts, unaffected (likely just scheduling luck: they didn't happen to need a fresh container during the broken window).
+
+**Consequence**: this reverts the controller `key`-auth fix and the rebuilt dashboard back to whatever binary each job's base artifact provides, **the next time either job is rescheduled** (already-running processes keep the patched binary in memory until then — no immediate change). The source fixes themselves (commit `17b518ee` in `flynn`, and the ability to rebuild the dashboard from HEAD, both documented above) are unaffected and remain the correct long-term fix; they should be delivered via a proper TUF/IPFS artifact publish (see "Release workflow" in Phase 7 above) rather than `bin-overrides`, until `host/libcontainer_backend.go`'s bin-override code is itself patched to be merged-usr-safe (e.g. by writing into `/usr/bin` — the symlink target — instead of unconditionally `MkdirAll`-ing `/bin`, or by skipping the override entirely when the target path is a symlink to a directory that already contains other entries).
+
+**Follow-up (not yet done)**: fix `host/libcontainer_backend.go`'s bin-override injection to resolve symlinks before deciding where to write (or resolve `/bin` → `/usr/bin` explicitly), then re-add `bin-overrides` support with a regression test covering a merged-usr base image before ever repopulating `/etc/flynn/bin-overrides` on this cluster again.
+
+### Dashboard: auto-provision Let's Encrypt cert on new routes (2026-09-09)
+
+**Feature gap** (reported alongside the crash above): the dashboard's "Add new domain" dialog always created a plain HTTP route with no `acme_domain` and no certificate — confirmed in `actions/app-routes.js`/`views/app-route-new.js.jsx`: the `CREATE_APP_ROUTE` payload only ever contained `{type, service, domain, path, drain_backends}`. This isn't a regression, it's how the dashboard has always worked; the controller side already fully supports it (`POST /certs/letsencrypt` + `SyncACMECert` matching on `acme_domain`, exactly what was done manually for the p22 routes earlier) — only the dashboard needed wiring.
+
+**Fix** (`flynn` commit `2de67baf`): `client.js` gained `provisionACMECert(domains)` (`POST /certs/letsencrypt`, Basic Auth — no `EventSource`/query-param auth involved here, so unaffected by the earlier 401 bug). `actions/app-routes.js`'s `createAppRoute` now sets `acme_domain: route.domain` on route creation, then calls `provisionACMECert([domain])` right after; provisioning failure (e.g. domain not delegated to the configured ACME DNS provider) is logged to the console but doesn't block the route, which keeps working over plain HTTP. Once a cert lands, the existing `SyncACMECert` → `ROUTE` event → `AppRoutesStore` flow updates the UI automatically (and now works reliably since the dashboard's real-time `/events` stream is also `EventSource`-based and benefits from the same `?key=` authorizer fix from the section above).
+
+**Rebuild & deploy — second, much more careful `bin-overrides` incident**: rebuilt the dashboard the same way as before (Node 12 / Python 2 / go-bindata pipeline). Before redeploying, explicitly checked whether the dashboard's own base image is merged-usr (it isn't — `ls -la` on the cached squashfs layer shows `/bin` as a **real directory**, only `/sbin -> bin` is a symlink), so `bin-overrides` was judged safe *for the dashboard's own container*. Applied the binary to all 5 hosts in parallel, restarted both dashboard replicas, and removed `/etc/flynn/bin-overrides` again within roughly 15 seconds of applying it — but that was still long enough for the scheduler to (re)start **`example-http`, `blobstore`, `postgres`, `mongodb`, `mariadb`, and `redis`** on the same hosts during the window, all Ubuntu/merged-usr-based, all hit by the same shadowed-`/bin` bug (`blobstore`/`postgres`/`mongodb`/`mariadb`/`redis` failed with `exec: "/bin/flynn-<name>": stat ...: no such file or directory` — the *binary itself* missing this time, not just a shebang interpreter, since these are compiled Go binaries placed directly under `/bin` in their merged-usr images). All six recovered automatically on their next restart attempt once `bin-overrides` was removed (`state: up`, no `host_error`, restart counters stopped climbing); confirmed via `https://controller.flynn.lab.p22.de/ping` + `/apps` (200, which transitively proves postgres — the controller's `DATABASE_URL` backend — is healthy) and `https://example-http.flynn.lab.p22.de/` (200).
+
+**Conclusion — do not use `bin-overrides` on this cluster again** until `host/libcontainer_backend.go` itself is fixed to be merged-usr-safe. Even a ~15-second window with only *one* target binary in the override directory was enough to crash six unrelated core/system apps, because the code path triggers unconditionally for *every* container start on a host, not just ones that need an override. Any future controller/dashboard binary fix should go through a proper artifact rebuild + TUF/IPFS publish (see the "Release workflow" under Phase 7) instead.
+
+### Separate incident: `flynn-host` itself crash-looping on node2 (2026-09-09)
+
+**Symptom**: dashboard reported unreachable by the user. Root cause was unrelated to the bin-overrides bug above: `flynn-host` (the per-host daemon, not a container job) was itself in an infinite crash loop on `node2` (`192.168.50.12`) — systemd restart counter at 673+ and climbing every ~5.5s, `journalctl -u flynn-host`: `could not restore from host persistence db: error loading container state: container "node2-443c6d35-6738-496e-b11d-cd2d9aefa22b" does not exist` (`host/state.go` `Restore()`, called from `host.go:450`). With `flynn-host` unable to start, that host had **no discoverd, no flannel, nothing** running — likely triggered by the earlier `pkill -f /bin/flynn-controller`/`flynn-dashboard` restarts in this session, which kill the job process directly and bypass flynn-host's normal stop/cleanup path, leaving a stale reference in its local BoltDB (`/var/lib/flynn/host-state.bolt`) to a container libcontainer had already fully removed.
+
+**Fix**: stopped `flynn-host` (`systemctl stop`), backed up `host-state.bolt`, wrote a small standalone Go tool (using the vendored `github.com/boltdb/bolt`, built and run directly on the host, not committed) to open the DB and delete **only the exact key** `node2-443c6d35-6738-496e-b11d-cd2d9aefa22b` from the `jobs` and `backend-jobs` buckets (verified present in exactly those two buckets first, via a dry-run/read-only pass, before deleting). A first attempt used a substring match against both keys *and values*, which over-matched and additionally wiped the `backend-global`/`backend` blob and the `persistent-jobs`/`flannel` entry — caught immediately, restored from the pre-change backup, and redone with an exact-key-only match touching just the two intended buckets. `flynn-host` then started and stayed up.
+
+**Residual gap (not fully resolved)**: the deleted job was actually node2's **flannel** job. Flynn-host's local "persistent job" resurrection (the `persistentBucket` logic in `state.go`'s `Restore()`) can only resurrect a job it still has a definition for in the `jobs` bucket — since that entry is now gone, flannel is not automatically recreated on node2. Discoverd *did* self-heal (a different persistent-jobs entry, untouched, resurrected it under a new job ID, and it successfully rejoined the cluster's raft peer set — confirmed via `GET /raft/peers` on node2 returning all 5 hosts). However `node2` still doesn't reappear in the cluster-wide `flynn-host` discoverd service list even after multiple `flynn-host` restarts, and no new flannel job has been scheduled there by the controller's scheduler despite `flannel` being an `omni: true` process (should be 1-per-host); scheduler logs show it does see discoverd service events from node2 but rejects them as `"error handling service event, unknown job"` since the locally-resurrected job ID was never one the scheduler created. **Net effect**: the cluster runs fine on the other 4 hosts (confirmed dashboard reachable 6/6 consecutive checks, both http/https) but node2 is a degraded/idle cluster member pending a proper host-rejoin fix — follow-up needed, not resolved in this session.
+
+### Verified: ACME auto-provisioning works for domains delegated to `run.consolving.net` (2026-09-09)
+
+Checked actual DNS delegation: `p22.de` → `ns1-4.consolving.de` (registrar defaults), but `lab.p22.de`, `flynn.p22.de`, and `apps.flynn.p22.de` are all separately delegated to **`run.consolving.net`** — the same custom DNS host that successfully served the `*.flynn.lab.p22.de` DNS-01 challenge earlier. Live end-to-end test (mimicking the new dashboard flow exactly, via direct API calls against `example-http`): created a route for `test.apps.flynn.p22.de` with `acme_domain` set, then `POST /certs/letsencrypt` — **succeeded**, real Let's Encrypt certificate issued (`CN=test.apps.flynn.p22.de`, issuer YR1, valid until 2026-12-08), and it auto-attached to the route via the existing `SyncACMECert` flow (`certificate_details` populated correctly). Confirms the current `ACME_DNS_CONFIG`/autodns context works for **any domain delegated to `run.consolving.net`**, not just `*.flynn.lab.p22.de` — i.e. `flynn.p22.de` and its subdomains are covered too, but plain `p22.de` or any other branch not delegated there would not be. (The route itself returned `http 404`/`https` connection failure when tested live — expected, since DNS-01 only proves domain ownership via a TXT record and doesn't create the A/CNAME needed for actual traffic; the test route and its domain were never meant to resolve to the cluster.) Test route deleted after verification; the issued cert was left in place (unused certs are harmless, no need to revoke).
+
+### Two more infra bugs found while debugging "dashboard unreachable" (2026-09-09)
+
+**Bug 1 — asymmetric NAT routing (host-level, outside Flynn)**: the user's browser could resolve `dashboard.flynn.lab.p22.de` (real public DNS → `192.168.168.87`, this Proxmox host's LAN IP) and ping it fine, but every HTTPS/HTTP connection hung until timeout. Diagnosed via coordinated `tcpdump` captures on both the LAN-facing (`vmbr0`) and cluster-facing (`virbr2`) interfaces while the user retried `curl -v`: the client's SYN reliably arrived at `192.168.50.11:443` (the DNAT target, `node1`) with the **original client IP preserved** (`192.168.168.72`, correct DNAT behavior) — but no reply ever came back. Root cause: `node1`'s own default route points out a *different* interface/gateway (`ens6` → `192.168.121.1`, an unrelated libvirt network) rather than back through `ens7` (`192.168.50.0/24`, where our NAT host lives), because the VM has no specific route for the client's real (foreign) subnet `192.168.168.0/24`. Its reply therefore left via the wrong interface and was never seen again — while requests originating *from* `192.168.50.0/24` (or from this host itself, hairpin-style) worked fine, since the VM has an explicit route for that subnet and replies correctly.
+- **Fix**: added `POSTROUTING` `MASQUERADE` rules on the NAT host for traffic destined to `192.168.50.11:80` and `:443`, so the VM always sees forwarded requests as coming from the gateway itself (`192.168.50.1`, on its own subnet) rather than the real external client IP — guaranteeing a symmetric reply path. Applied live (`iptables -t nat -A POSTROUTING -d 192.168.50.11/32 -p tcp --dport {80,443} -j MASQUERADE`) and persisted in `/etc/iptables/rules.v4` (validated with `iptables-restore --test` before/after) so it survives a reboot. Verified: `curl` from the user's real machine over the actual DNAT path succeeded immediately after.
+- This NAT setup predates this session entirely (not something introduced by any earlier change here) — it was presumably only ever tested from hosts within `192.168.50.0/24` or from the gateway itself, never from a genuinely external LAN client, which is why the asymmetry went unnoticed until now.
+
+**Bug 2 — router's route/cert sync goes stale when its watched controller instance dies**: even after fixing the NAT issue, a *newly added* dashboard route (`test123.flynn.lab.p22.de`, created via the new "Add domain" ACME flow, confirmed to have a valid attached Let's Encrypt cert via the controller API) failed TLS with `SSL routines::tlsv1 alert internal error` — the exact same router-level "no cert for this SNI" symptom seen earlier for `controller.flynn.lab.p22.de` before that route existed. Root cause: `router/store.go`'s `NewControllerStore()` picks `discoverd.NewService("controller").Instances()[0]` — the *first* controller instance — **once**, at router startup, and opens a long-lived `StreamEvents` SSE subscription to specifically that instance (`router/sync.go`'s `Syncer.Sync`) for real-time route/cert updates. It never re-resolves or reconnects to a different instance if that one goes away. Given how many times the controller has been killed/rescheduled across this whole session, the actual external-facing router (the one instance on `node1`/`192.168.50.11`, since inbound traffic is DNAT'd to a single fixed host — 3 *other* router replicas exist but never receive real external traffic and were a red herring) had been running since `Sep08` boot, watching a controller instance that no longer existed, and had silently stopped receiving any route/cert updates since.
+- **Fix**: restarted the router process on `node1` (`pkill -f /bin/flynn-router`, scheduler creates a fresh job — no `bin-overrides` involved, so none of the merged-usr risk from earlier applies). On startup it does a full `List()` + fresh `Watch()` against a currently-live controller instance, immediately picking up `test123`'s route and cert. Verified `test123.flynn.lab.p22.de` now returns 200.
+- **Follow-up (not fixed)**: this is a latent architecture gap, not specific to today's incidents — *any* time every controller instance the external router was originally watching gets replaced, route/cert sync silently goes stale until the router itself is restarted, with no self-healing and no obvious error surfaced anywhere. A proper fix would have `router/store.go` re-resolve/reconnect to a live controller instance (or subscribe via discoverd instance-change notifications) instead of pinning to a single instance address for the router process's entire lifetime.
+
+**Bug 3 (user-side, resolved by the user directly) — no DNS record for newly-added domains**: `test123.flynn.lab.p22.de` still failed to resolve at all for the user even after Bug 2 was fixed, since it (like the earlier `test.apps.flynn.p22.de` test) never had a DNS record — the dashboard's ACME auto-provisioning gets a certificate via DNS-01 without ever needing/creating an A record, so a brand new hostname has no way to route real traffic until DNS is added. The user added a **wildcard** entry in the local Pi-hole (`*.flynn.lab.p22.de` → `192.168.168.87`, confirmed via `dig` for a random nonexistent subdomain also resolving) rather than a one-off host entry, so any future dashboard-added route now resolves automatically for LAN clients using Pi-hole, without further manual DNS edits per domain. Not something fixable from the cluster/agent side — Pi-hole's local DNS config is managed directly by the user, outside the API surface available here.

@@ -241,13 +241,15 @@ setup_networking() {
 		rm -f /etc/netplan/50-vagrant*.yaml 2>/dev/null || true
 	fi
 
-	# Find the private cluster interface by deterministic MAC OUI
+# Find the private cluster interface by deterministic MAC OUI
 	local priv_iface=""
 	for iface in $(ls /sys/class/net/ | grep -v lo | sort); do
 		if [[ -d "/sys/class/net/${iface}" ]]; then
 			local mac
 			mac=$(cat "/sys/class/net/${iface}/address")
-			if [[ "$mac" =~ ^52:54:00:[Ff][Dd]: ]]; then
+			# Match Flynn's private network MAC OUI (52:54:00:FD:00:XX) exactly
+			# Must be fd/fd (lowercase) or FD/FD (uppercase), NOT fe/fe (management network)
+			if [[ "$mac" =~ ^52:54:00:[Ff][Dd]: ]] && ! [[ "$mac" =~ ^52:54:00:[Ff][Ee]: ]]; then
 				priv_iface="${iface}"
 				break
 			fi
@@ -291,7 +293,25 @@ setup_networking() {
 	if ! ip rule show | grep -q "from ${NODE_IP} lookup 50"; then
 		info "Adding policy route: replies to ${NODE_IP} go out ${priv_iface}"
 		ip rule add from "${NODE_IP}" lookup 50 priority 100
-		ip route add default via "${PRIVATE_SUBNET_GW:-${NODE_IP%.*}.1}" dev "${priv_iface}" table 50
+		
+		# Add route with retry logic to handle timing issues
+		local gw="${PRIVATE_SUBNET_GW:-${NODE_IP%.*}.1}"
+		local max_attempts=5
+		local attempt=1
+		while [[ $attempt -le $max_attempts ]]; do
+			if ip route add default via "${gw}" dev "${priv_iface}" table 50 2>/dev/null; then
+				info "Policy route added successfully"
+				break
+			else
+				warn "Failed to add policy route (attempt ${attempt}/${max_attempts}), retrying in 2s..."
+				sleep 2
+				attempt=$((attempt + 1))
+			fi
+		done
+		if [[ $attempt -gt $max_attempts ]]; then
+			fail "Failed to add policy route after ${max_attempts} attempts"
+		fi
+		
 		cat > /etc/systemd/system/flynn-data-route.service <<-UNITEOF
 		[Unit]
 		Description=Route replies to the data-network IP via the data NIC (fixes asymmetric routing for external access)
@@ -341,6 +361,31 @@ setup_networking() {
 	if [[ $dns_attempts -ge $dns_max ]]; then
 		warn "DNS resolution may not be working — continuing anyway"
 	fi
+
+	# Add local IPFS gateway to /etc/hosts to serve layer files
+	info "Adding local IPFS gateway to /etc/hosts..."
+	echo "192.168.121.1 dl.consolving.net" >> /etc/hosts
+
+	# Trust the local layer-proxy's self-signed CA so HTTPS layer downloads
+	# from dl.consolving.net (redirected above) succeed. This is a temporary
+	# workaround for the fact that the real dl.consolving.net IPFS gateway
+	# does not have current release layers pinned.
+	info "Installing local layer-proxy CA certificate..."
+	cat > /usr/local/share/ca-certificates/flynn-layer-proxy-ca.crt <<-'CAEOF'
+	-----BEGIN CERTIFICATE-----
+	MIIBkzCCATmgAwIBAgIUdI50CpGqorc4AtXv86bkHfEBNRAwCgYIKoZIzj0EAwIw
+	HzEdMBsGA1UEAwwURmx5bm4gTGF5ZXIgUHJveHkgQ0EwHhcNMjYwOTA4MDcwODQ0
+	WhcNMzYwOTA1MDcwODQ0WjAfMR0wGwYDVQQDDBRGbHlubiBMYXllciBQcm94eSBD
+	QTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABMfQyI8v87VeAIDs6fbHnzcbWUtd
+	JOOJ3Upy879xSye10Cd5aVkfp/XLMIKvrTMLbsiboSoSBHIZ9KqOkLl+uf6jUzBR
+	MB0GA1UdDgQWBBS6qhAbRcqCLk5ydMG71PtpPQZ+DjAfBgNVHSMEGDAWgBS6qhAb
+	RcqCLk5ydMG71PtpPQZ+DjAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gA
+	MEUCIGlF04woMWCotzo3FTHI6swms9wEztc3hVqpeOh0f1JIAiEAnC2eZCL2geTA
+	0hD909r8ZGY6ETc6fhU3a0+1eNhP5KI=
+	-----END CERTIFICATE-----
+	CAEOF
+	update-ca-certificates >/dev/null 2>&1 || warn "update-ca-certificates failed (non-fatal)"
+
 }
 
 # --- Step 6: Download and install Flynn ---------------------------------------
@@ -397,6 +442,7 @@ install_flynn() {
 	mkdir -p "$tmpdir"
 
 	info "Downloading Flynn components via flynn-host download..."
+	export FLYNN_VERSION="v20260907.2"
 	TMPDIR="$tmpdir" "$bootstrap_binary" download \
 		--repository "${REPO_URL}" \
 		--tuf-db "/etc/flynn/tuf.db" \
