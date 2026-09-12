@@ -20,3 +20,6 @@ vagrant/.vagrant/
 
 # Local binaries and cluster config
 bin/
+
+# Local Go toolchain / module + build caches (portable build env)
+.tools/
