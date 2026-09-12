@@ -114,7 +114,7 @@ Go 1.13 was 6+ years old and unsupported. Upgraded to Go 1.22.12 in a single jum
 - [x] Test compilation with the target Go version, fixing breakages iteratively
 - [x] Migrate base layer images from Ubuntu 18.04 Bionic to Ubuntu 24.04 Noble (see Phase 5.5 below)
 - [x] Evaluate migrating from `vendor/` to Go module proxies — **Decision: keep vendored** (see below)
-- [ ] Update `libcontainer`/`runc` fork to a maintained version compatible with modern kernels
+- [x] Update `libcontainer`/`runc` fork to a maintained version compatible with modern kernels (2026-09-11) — see "runc Fork → Upstream v1.5.1 Migration" below
 
 Additionally completed:
 - [x] **Go version**: Upgraded from Go 1.13.15 to Go 1.22.12 (latest patch of 1.22 line)
@@ -165,9 +165,29 @@ Additionally completed:
 - **runc fork modernization**: The Flynn runc fork (`v1.0.0-rc1001`) is 6+ years behind on security patches. Upgrading requires extracting the veth/loopback networking into Flynn's own code (using `vishvananda/netlink` directly), then migrating to modern runc. This is a significant undertaking tied to Phase 6 cluster bootstrap work.
 - **~~Base layer migration~~**: Complete — migrated to Ubuntu 24.04 Noble in Phase 5.5.
 
+#### runc Fork → Upstream v1.5.1 Migration (2026-09-11)
+
+**Status**: Migration implemented and committed (flynn branch `feat/runc-v151`, commit `9d61779c`, `host: migrate libcontainer to upstream runc v1.5.1`); **cluster validation pending** (no KVM/CAP_NET_ADMIN on the build box — gate is a single-node Vagrant bootstrap, same as the original fork-patch validation requirement).
+
+**What changed** (follows the extraction map above, with one important discovery): upstream runc **re-added** veth-style networking after the rc8 era, but in a new form — the `veth`/`loopback` strategies are gone, replaced by `configs.NetDevices` (pre-created host devices moved into the container's netns and renamed atomically by `setupNetworkDevices()` during `initProcess.start()`, before the user binary execs). So the in-namespace remainder (MAC/IP/MTU/gateway + loopback up) had to be done by Flynn itself, and is done from the host via a temporary `setns(CLONE_NEWNET)` into the container's netns, with no capability increase for app jobs:
+
+- `host/libcontainer_backend.go`:
+  - `createVethPair()` + `attachVethToBridge()` — host-side veth creation and bridge attach (netlink directly, mirroring the old strategy's `create`/`attach`).
+  - `configs.NetDevices{peerName: {Name: "eth0"}}` — libcontainer moves+renames the peer into the container netns (upstream-maintained path).
+  - `configureContainerNetwork(pid, initConfig)` — after `c.Run()` returns (netns exists, eth0 moved, and the job's app is still parked at containerinit's resume gate), enters the container netns: up loopback, then eth0 MAC/address/MTU/default-route; `setns` back (exits the daemon on failure to return — no safe recovery).
+  - `cleanup()` now removes the host-side veth end (previously leaked attached to the bridge).
+- `host/types/defaults.go`: Flynn's own copy of the rc8 default device lists (runc dropped `DefaultAllowedDevices`), now in the `opencontainers/cgroups` `Rule`/`Device` types; allow rules carry `Allow: true` (new v1 device emulator is allow/deny explicit).
+- `host/host.go`: re-exec dispatch is now `os.Args[1] == "init"` guarded by `_LIBCONTAINER_SYNCPIPE` (runc spawns the init child with that env; the user-facing `flynn-host init` command is unaffected), calling `libcontainer.Init()`; obsolete gccgo-only `nsenter` blank import removed.
+- API mapping: `factory.Create/Load` → `libcontainer.Create(containerRoot, id, config)` / `libcontainer.Load`; `Process{Init: true, User: "root"}` → `Process{UID: 0, GID: 0}`; `configs.Cgroup`/`configs.Resources` → `github.com/opencontainers/cgroups` v0.0.6 (`Cgroup.Path` + `Resources.Devices` rules; `IsCgroup2UnifiedMode`/`GetAllSubsystems`/`FindCgroupMountpoint` moved there unchanged).
+- `go.mod`: `opencontainers/runc v1.5.1` (replace directive to `flynn/runc v1.0.0-rc1001` removed), `opencontainers/cgroups v0.0.6`, `vishvananda/netlink v1.3.1` (from the 2017 pseudo-version), `golang.org/x/sys v0.46.0`, `godbus/dbus/v5 v5.2.2`; `go mod tidy && go mod vendor` (no new cgo build requirements: seccomp-golang stays behind its `cgo && seccomp` build tags, already vendored).
+
+**Validation so far**: `go build ./...` clean and `go test ./host` (incl. `libcontainer_backend_test.go`) green on Go 1.27.1 (CGO_ENABLED=0 build box; all new code is pure Go). gofmt clean. Remaining gate: single-node cluster bootstrap + container start/attach/stop over the new veth path, plus a host restart (state restore) test.
+
+**Rollout constraint**: `state.json` format changed — containers created by the old `flynn-host` cannot be restored by the new one. Drain/stop jobs before upgrading a host's binary (or accept restarting the jobs).
+
 #### runc Fork Patch Analysis for the Phase 6 Upgrade (2026-09-01)
 
-**Status**: Non-blocking, deferred to Phase 6 (cluster bootstrap verification required). Current fork builds clean and is functionally adequate — confirmed `go build ./host` succeeds against `github.com/flynn/runc v1.0.0-rc1001`.
+**Status**: Superseded by the 2026-09-11 migration above (analysis was accurate; the extraction map held). Kept for reference.
 
 **The two Flynn fork patches (per AGENTS.md + Phase 5 audit, verified in vendored source at `vendor/github.com/opencontainers/runc/`)**:
 1. **veth/loopback network setup restore**: Upstream runc rc8-era removed the per-container veth wiring; the fork restores it in `libcontainer/network_linux.go` — the `veth` strategy (`create`/`attach`/`detach`, lines 107-232) and the `loopback` strategy (lines 87-105), dispatched by `getStrategy` from `configs.Network.Type` (`"veth"`, `"loopback"`).
